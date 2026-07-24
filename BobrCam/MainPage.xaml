@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
              xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:local="clr-namespace:BobrCam"
              x:Class="BobrCam.MainPage"
              Title="BobrCam">
     <Grid Padding="24" RowDefinitions="*,Auto" RowSpacing="18"
           BackgroundColor="{AppThemeBinding Light=#FFF8F2, Dark=#211918}">
-        <Border Grid.Row="0" Stroke="#F45145" StrokeThickness="2" StrokeShape="RoundRectangle 16">
-            <Image x:Name="PreviewImage" Aspect="AspectFit" BackgroundColor="Black" />
+        <Border Grid.Row="0" Stroke="#F45145" StrokeThickness="2" StrokeShape="RoundRectangle 16" BackgroundColor="Black">
+            <Grid>
+                <Image x:Name="PreviewImage" Aspect="AspectFit" BackgroundColor="Black" />
+                <local:CameraPreview x:Name="CameraPreview" BackgroundColor="Black" />
+            </Grid>
         </Border>
 
         <VerticalStackLayout x:Name="AndroidPanel" Grid.Row="1" Spacing="14">
