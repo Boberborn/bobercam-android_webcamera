@@ -1,0 +1,15 @@
+# Build output
+**/bin/
+**/obj/
+
+# Local tools and reference material
+.agents/
+.codex/
+outputs/
+work/
+.vs/
+
+# User and IDE files
+*.user
+*.suo
+*.pfx

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="BobrCam.MainPage"
+             Title="BobrCam">
+    <Grid Padding="24" RowDefinitions="*,Auto" RowSpacing="18"
+          BackgroundColor="{AppThemeBinding Light=#FFF8F2, Dark=#211918}">
+        <Border Grid.Row="0" Stroke="#F45145" StrokeThickness="2" StrokeShape="RoundRectangle 16">
+            <Image x:Name="PreviewImage" Aspect="AspectFit" BackgroundColor="Black" />
+        </Border>
+
+        <VerticalStackLayout x:Name="AndroidPanel" Grid.Row="1" Spacing="14">
+            <Grid ColumnDefinitions="*,120" ColumnSpacing="10">
+                <Entry x:Name="AndroidIpEntry" Placeholder="Windows IP (auto if empty)" Keyboard="Url" />
+                <Entry x:Name="AndroidPortEntry" Grid.Column="1" Text="28444" Placeholder="Port" Keyboard="Numeric" />
+            </Grid>
+            <Grid ColumnDefinitions="*,*" ColumnSpacing="10">
+                <Button x:Name="UsbButton" Text="Connect USB" FontSize="18" HeightRequest="60"
+                        BackgroundColor="#FF9A35" Clicked="OnUsbConnectClicked" />
+                <Button x:Name="WifiButton" Grid.Column="1" Text="Connect Wi-Fi" FontSize="18" HeightRequest="60"
+                        BackgroundColor="#F45145" Clicked="OnWifiConnectClicked" />
+            </Grid>
+            <Label x:Name="AndroidStatusLabel" Text="Choose USB or Wi-Fi." HorizontalTextAlignment="Center" />
+        </VerticalStackLayout>
+
+        <VerticalStackLayout x:Name="WindowsPanel" Grid.Row="1" Spacing="8">
+            <Label Text="Windows receiver" FontAttributes="Bold" FontSize="18" />
+            <Grid ColumnDefinitions="*,120,Auto" ColumnSpacing="10">
+                <Entry x:Name="WindowsIpEntry" Placeholder="Listen IP" Keyboard="Url" />
+                <Entry x:Name="WindowsPortEntry" Grid.Column="1" Text="28444" Placeholder="Port" Keyboard="Numeric" />
+                <Button Grid.Column="2" Text="Apply" Clicked="OnApplyReceiverClicked" />
+            </Grid>
+            <Label x:Name="ReceiverAddressLabel" />
+            <Label x:Name="WindowsStatusLabel" Text="Starting secure receiver…" />
+        </VerticalStackLayout>
+
+    </Grid>
+</ContentPage>
