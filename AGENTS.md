@@ -47,6 +47,12 @@ dotnet build .\BobrCam\BobrCam.csproj -f net10.0-windows10.0.19041.0 -m:1 -p:Use
 
 Known existing warnings: obsolete Android legacy camera APIs and MAUI `MainPage` initialization.
 
+## Deploying to a phone
+When updating the Android app on a phone:
+1. Run `adb devices` once to check the connection.
+2. If the device is listed, continue with the deploy.
+3. If the device is not listed after that single check, stop and notify the user to enable USB debugging on the phone and reconnect it. Do not retry multiple times or continue the deploy.
+
 ## Branding
 - Product: `BobrCam`
 - Subtitle: `Free Webcam for OBS & PC`
