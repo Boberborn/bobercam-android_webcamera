@@ -5,34 +5,9 @@ public partial class MainPage : ContentPage
     private readonly VideoReceiver _receiver = new();
     private bool _receiverStarted;
     private bool _fitWindowOnce = true;
-
-    private static bool TryGetJpegDimensions(byte[] jpeg, out int width, out int height)
-    {
-        width = 0;
-        height = 0;
-        if (jpeg.Length < 10 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) return false;
-        int i = 2;
-        while (i < jpeg.Length - 1)
-        {
-            if (jpeg[i] == 0xFF && jpeg[i + 1] >= 0xC0 && jpeg[i + 1] <= 0xCF && jpeg[i + 1] != 0xC4 && jpeg[i + 1] != 0xC8)
-            {
-                if (i + 9 < jpeg.Length)
-                {
-                    height = (jpeg[i + 5] << 8) | jpeg[i + 6];
-                    width = (jpeg[i + 7] << 8) | jpeg[i + 8];
-                    return width > 0 && height > 0;
-                }
-            }
-            if (jpeg[i] != 0xFF) { i++; continue; }
-            int marker = jpeg[i + 1];
-            if (marker is >= 0xD0 and <= 0xD9) break;
-            if (marker is 0xFF) { i++; continue; }
-            if (i + 3 >= jpeg.Length) break;
-            int segLen = (jpeg[i + 2] << 8) | jpeg[i + 3];
-            i += 2 + segLen;
-        }
-        return false;
-    }
+#if ANDROID
+    private bool _androidAutoConnectStarted;
+#endif
 
     public MainPage()
     {
@@ -40,33 +15,49 @@ public partial class MainPage : ContentPage
 #if WINDOWS
         AndroidPanel.IsVisible = false;
         WindowsPanel.IsVisible = true;
+        WindowsFpsLabel.IsVisible = true;
+        H264PreviewRenderer.StatusChanged += status =>
+            MainThread.BeginInvokeOnMainThread(() => WindowsStatusLabel.Text = status);
+        H264PreviewRenderer.FpsChanged += fps =>
+            MainThread.BeginInvokeOnMainThread(() =>
+                WindowsFpsLabel.Text = $"{fps:0.0} FPS");
 #else
         AndroidPanel.IsVisible = true;
         WindowsPanel.IsVisible = false;
+        WindowsFpsLabel.IsVisible = false;
+        AndroidCameraStreamer.ConnectionStatusChanged += status =>
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                AndroidStatusLabel.Text = status;
+                UsbButton.IsEnabled = WifiButton.IsEnabled = true;
+            });
 #endif
         ReceiverAddressLabel.Text = $"This PC: {NetworkAddress.GetLocalIPv4Address()}";
-        _receiver.FrameReceived += jpeg =>
+        _receiver.StreamConfigured += (configuration, codecData) =>
         {
-            FrameBridge.Publish(jpeg);
 #if WINDOWS
+            H264PreviewRenderer.Configure(configuration, codecData);
             if (_fitWindowOnce)
             {
                 _fitWindowOnce = false;
-                if (TryGetJpegDimensions(jpeg, out var w, out var h))
+                var w = configuration.Width;
+                var h = configuration.Height;
+                MainThread.BeginInvokeOnMainThread(() =>
                 {
-                    MainThread.BeginInvokeOnMainThread(() =>
+                    if (Window is not null)
                     {
-                        if (Window is not null)
-                        {
-                            Window.Width = w + 96;
-                            Window.Height = h + 200;
-                        }
-                    });
-                }
+                        Window.Width = Math.Min(w + 96, 1600);
+                        Window.Height = Math.Min(h + 200, 1000);
+                    }
+                });
             }
 #endif
-            MainThread.BeginInvokeOnMainThread(() =>
-                PreviewImage.Source = ImageSource.FromStream(() => new MemoryStream(jpeg)));
+        };
+        _receiver.AccessUnitReceived += accessUnit =>
+        {
+#if WINDOWS
+            H264PreviewRenderer.Submit(accessUnit);
+#endif
         };
         _receiver.StatusChanged += status => MainThread.BeginInvokeOnMainThread(() => WindowsStatusLabel.Text = status);
 #if ANDROID
@@ -133,6 +124,11 @@ public partial class MainPage : ContentPage
         if (await Permissions.RequestAsync<Permissions.Camera>() == PermissionStatus.Granted)
         {
             await AndroidCameraStreamer.StartLocalPreviewAsync();
+            if (!_androidAutoConnectStarted && TryGetPort(AndroidPortEntry, out var port))
+            {
+                _androidAutoConnectStarted = true;
+                await ConnectCameraAsync("127.0.0.1", port, string.Empty, "USB");
+            }
         }
 #endif
     }
@@ -202,22 +198,8 @@ public partial class MainPage : ContentPage
         {
             AndroidStatusLabel.Text = $"Connecting securely by {mode}…";
             await AndroidCameraStreamer.StartAsync(host, port, fingerprint);
-            AndroidStatusLabel.Text = $"Connected by {mode} — encrypted stream active.";
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(2500);
-                var sent = AndroidCameraStreamer.FramesSent;
-                var err = AndroidCameraStreamer.LastError;
-                await MainThread.InvokeOnMainThreadAsync(() =>
-                {
-                    if (!string.IsNullOrEmpty(err))
-                        AndroidStatusLabel.Text = $"Camera frame error: {err}";
-                    else if (sent == 0)
-                        AndroidStatusLabel.Text = $"Connected by {mode}, but no camera frames yet (sent={sent}).";
-                    else
-                        AndroidStatusLabel.Text = $"Connected by {mode} — encrypted stream active (frames={sent}).";
-                });
-            });
+            AndroidStatusLabel.Text = $"{mode} auto-connect active.";
+            UsbButton.IsEnabled = WifiButton.IsEnabled = true;
         }
         catch (Exception ex)
         {

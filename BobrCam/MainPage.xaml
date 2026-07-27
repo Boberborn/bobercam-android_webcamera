@@ -10,6 +10,16 @@
             <Grid>
                 <Image x:Name="PreviewImage" Aspect="AspectFit" BackgroundColor="Black" />
                 <local:CameraPreview x:Name="CameraPreview" BackgroundColor="Black" />
+                <Label x:Name="WindowsFpsLabel"
+                       Text="0.0 FPS"
+                       IsVisible="False"
+                       HorizontalOptions="Start"
+                       VerticalOptions="Start"
+                       Margin="12"
+                       Padding="10,6"
+                       FontAttributes="Bold"
+                       TextColor="White"
+                       BackgroundColor="#B3211918" />
             </Grid>
         </Border>
 
@@ -24,7 +34,7 @@
                 <Button x:Name="WifiButton" Grid.Column="1" Text="Connect Wi-Fi" FontSize="18" HeightRequest="60"
                         BackgroundColor="#F45145" Clicked="OnWifiConnectClicked" />
             </Grid>
-            <Label x:Name="AndroidStatusLabel" Text="Choose USB or Wi-Fi." HorizontalTextAlignment="Center" />
+            <Label x:Name="AndroidStatusLabel" Text="USB auto-connect starting…" HorizontalTextAlignment="Center" />
         </VerticalStackLayout>
 
         <VerticalStackLayout x:Name="WindowsPanel" Grid.Row="1" Spacing="8">

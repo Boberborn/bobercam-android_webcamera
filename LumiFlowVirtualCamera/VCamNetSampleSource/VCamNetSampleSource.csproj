@@ -5,6 +5,7 @@
 		<Nullable>enable</Nullable>
 		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
 		<EnableComHosting>true</EnableComHosting>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<Platforms>x64;x86;ARM64</Platforms>
 		<AssemblyName>BobrCam.VirtualCameraSource</AssemblyName>
 	</PropertyGroup>

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using DirectN;
 using VCamNetSampleSource.Utilities;
@@ -30,37 +31,128 @@ namespace VCamNetSampleSource
 
         public bool HasD3DManager => _texture != null;
         public ulong FrameCount => _frameCount;
-        private static readonly string SharedFramePath =
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BobrCam", "Frames", "latest.jpg");
+        private const int SharedFrameHeaderSize = 64;
+        private const int SharedFrameMaxBytes = 1920 * 1920 * 4;
+        private const int SharedFrameMappingSize =
+            SharedFrameHeaderSize + SharedFrameMaxBytes;
+        private static readonly string SharedFrameFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "BobrCam",
+            "Frames",
+            "live.bgra");
+        private MemoryMappedFile? _sharedFrameMap;
+        private MemoryMappedViewAccessor? _sharedFrameView;
+        private IComObject<ID2D1Bitmap>? _lastPhoneFrame;
+        private int _lastPhoneFrameWidth;
+        private int _lastPhoneFrameHeight;
 
-        private bool TryDrawPhoneFrame()
+        private unsafe bool TryDrawPhoneFrame()
         {
-            if (_renderTarget == null || !File.Exists(SharedFramePath))
+            if (_renderTarget == null)
                 return false;
 
             try
             {
-                using var stream = new FileStream(SharedFramePath, FileMode.Open, FileAccess.Read,
-                    FileShare.ReadWrite | FileShare.Delete);
-                using var source = WICFunctions.LoadBitmapSource(stream, WICDecodeOptions.WICDecodeMetadataCacheOnLoad);
-                source.Object.GetSize(out var sourceWidth, out var sourceHeight).ThrowOnError();
-                _renderTarget.Object.CreateBitmapFromWicBitmap(source.Object, IntPtr.Zero, out var bitmap).ThrowOnError();
-                using var frame = new ComObject<ID2D1Bitmap>(bitmap);
+                if (_sharedFrameMap == null)
+                {
+                    using var file = new FileStream(
+                        SharedFrameFilePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete);
+                    _sharedFrameMap = MemoryMappedFile.CreateFromFile(
+                        file,
+                        null,
+                        SharedFrameMappingSize,
+                        MemoryMappedFileAccess.Read,
+                        HandleInheritability.None,
+                        leaveOpen: false);
+                }
+                _sharedFrameView ??= _sharedFrameMap.CreateViewAccessor(
+                    0,
+                    SharedFrameMappingSize,
+                    MemoryMappedFileAccess.Read);
 
-                var scale = Math.Min(_width / (float)sourceWidth, _height / (float)sourceHeight);
-                var width = sourceWidth * scale;
-                var height = sourceHeight * scale;
-                var left = (_width - width) / 2f;
-                var top = (_height - height) / 2f;
-                _renderTarget.DrawBitmap(frame, 1f,
-                    D2D1_BITMAP_INTERPOLATION_MODE.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    new D2D_RECT_F(left, top, left + width, top + height), null);
-                return true;
+                var view = _sharedFrameView;
+                if (view.ReadUInt32(0) != 0x42434631u || view.ReadInt32(4) != 1)
+                    return DrawLastPhoneFrame();
+                var sequence = view.ReadInt64(8);
+                if ((sequence & 1) != 0)
+                    return DrawLastPhoneFrame();
+                var sourceWidth = view.ReadInt32(16);
+                var sourceHeight = view.ReadInt32(20);
+                var stride = view.ReadInt32(24);
+                var length = view.ReadInt32(28);
+                if (sourceWidth <= 0 || sourceHeight <= 0 ||
+                    stride != sourceWidth * 4 ||
+                    length != sourceHeight * stride ||
+                    length > SharedFrameMaxBytes)
+                    return DrawLastPhoneFrame();
+
+                byte* pointer = null;
+                ID2D1Bitmap bitmap;
+                try
+                {
+                    view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
+                    var properties = new D2D1_BITMAP_PROPERTIES
+                    {
+                        dpiX = 96,
+                        dpiY = 96,
+                        pixelFormat = new D2D1_PIXEL_FORMAT
+                        {
+                            format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode = D2D1_ALPHA_MODE.D2D1_ALPHA_MODE_IGNORE
+                        }
+                    };
+                    _renderTarget.Object.CreateBitmap(
+                        new D2D_SIZE_U((uint)sourceWidth, (uint)sourceHeight),
+                        (IntPtr)(pointer + view.PointerOffset + SharedFrameHeaderSize),
+                        (uint)stride,
+                        ref properties,
+                        out bitmap).ThrowOnError();
+                }
+                finally
+                {
+                    if (pointer is not null)
+                        view.SafeMemoryMappedViewHandle.ReleasePointer();
+                }
+
+                if (view.ReadInt64(8) != sequence)
+                {
+                    Marshal.ReleaseComObject(bitmap);
+                    return DrawLastPhoneFrame();
+                }
+                var previousFrame = _lastPhoneFrame;
+                _lastPhoneFrame = new ComObject<ID2D1Bitmap>(bitmap);
+                _lastPhoneFrameWidth = sourceWidth;
+                _lastPhoneFrameHeight = sourceHeight;
+                previousFrame?.Dispose();
+                return DrawLastPhoneFrame();
             }
             catch
             {
-                return false;
+                return DrawLastPhoneFrame();
             }
+        }
+
+        private bool DrawLastPhoneFrame()
+        {
+            var frame = _lastPhoneFrame;
+            if (_renderTarget == null || frame == null ||
+                _lastPhoneFrameWidth <= 0 || _lastPhoneFrameHeight <= 0)
+                return false;
+
+            var scale = Math.Min(
+                _width / (float)_lastPhoneFrameWidth,
+                _height / (float)_lastPhoneFrameHeight);
+            var width = _lastPhoneFrameWidth * scale;
+            var height = _lastPhoneFrameHeight * scale;
+            var left = (_width - width) / 2f;
+            var top = (_height - height) / 2f;
+            _renderTarget.DrawBitmap(frame, 1f,
+                D2D1_BITMAP_INTERPOLATION_MODE.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                new D2D_RECT_F(left, top, left + width, top + height), null);
+            return true;
         }
 
         // common to CPU & GPU
@@ -364,8 +456,11 @@ namespace VCamNetSampleSource
                         _texture.SafeDispose();
                         _textFormat.SafeDispose();
                         _dwrite.SafeDispose();
+                        _lastPhoneFrame.SafeDispose();
                         _renderTarget.SafeDispose();
                         _converter.SafeDispose();
+                        _sharedFrameView?.Dispose();
+                        _sharedFrameMap?.Dispose();
                     }
 
                     // free unmanaged resources (unmanaged objects) and override finalizer

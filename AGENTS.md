@@ -37,6 +37,73 @@ After editing:
 - Ignore unrelated known warnings unless requested.
 - Report changed files, build result, and remaining limitations.
 
+## Tooling
+
+### Build & deploy
+
+```powershell
+dotnet --version                   # 10.0.302
+dotnet build .\BobrCam.csproj -f net10.0-android   # Android
+dotnet build .\BobrCam.csproj -f net10.0-windows10.0.19041.0  # Windows
+msbuild .\BobrCam.csproj          # MSBuild alternative
+adb devices                        # check phone connection
+adb reverse tcp:28444 tcp:28444    # USB tunnel
+gh pr create / gh pr checkout      # GitHub workflow
+docker ps                          # container management
+```
+
+### Code search
+
+```powershell
+rg "pattern" --type cs             # ripgrep — fast code search
+fd "CameraPreview"                 # fd — find files fast
+bat MainPage.xaml.cs               # bat — syntax-highlighted cat
+fzf                                # fzf — interactive fuzzy finder
+jq '.Width' < config.json          # jq — parse JSON
+yq eval '.field' config.yaml       # yq — parse YAML
+```
+
+### H.264 / TLS / Network
+
+```powershell
+ffprobe -show_packets captured.h264        # inspect encoded stream
+openssl s_client -connect 192.168.1.5:28444 # debug TLS handshake
+wireshark                              # capture & inspect H.264 over TLS
+curl.exe -o test.h264 http://...        # download test stream
+```
+
+### Video info
+
+```powershell
+mediainfo captured.mp4             # container/codec metadata
+ffprobe -v quiet -print_format json -show_format input.mp4  # inspect as JSON
+```
+
+### Debug (GUI)
+
+```powershell
+procmon                             # Process Monitor — syscall/file/registry trace
+procexp                             # Process Explorer — process tree + handles
+windbgx                             # WinDbg — crash dump analysis
+```
+
+### Scripting & helpers
+
+```powershell
+python -m http.server 8080          # ad-hoc test server
+sqlite3 .dump bobrcam.db            # inspect local state (if applicable)
+7z x ffmpeg.7z                      # extract archives
+pwsh -c "command"                   # PowerShell 7 operations
+```
+
+### Nice to have (not agent-usable)
+
+```powershell
+code .\BobrCam\                     # VS Code quick edit
+```
+
+## Build (MSBuild commands)
+
 ## Build
 Run from the repository root:
 
