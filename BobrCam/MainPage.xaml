@@ -33,12 +33,12 @@
                 <Entry x:Name="AndroidPortEntry" Grid.Column="1" Text="28444" Placeholder="Port" Keyboard="Numeric" />
             </Grid>
             <Grid ColumnDefinitions="*,*" ColumnSpacing="10">
-                <Button x:Name="UsbButton" Text="Connect USB" FontSize="18" HeightRequest="60"
+                <Button x:Name="UsbButton" Text="Connect USB (ADB)" FontSize="18" HeightRequest="60"
                         BackgroundColor="#FF9A35" Clicked="OnUsbConnectClicked" />
                 <Button x:Name="WifiButton" Grid.Column="1" Text="Connect Wi-Fi" FontSize="18" HeightRequest="60"
                         BackgroundColor="#F45145" Clicked="OnWifiConnectClicked" />
             </Grid>
-            <Label x:Name="AndroidStatusLabel" Text="USB auto-connect starting…" HorizontalTextAlignment="Center" />
+            <Label x:Name="AndroidStatusLabel" Text="Connect by Wi-Fi or USB debugging." HorizontalTextAlignment="Center" />
         </VerticalStackLayout>
 
         <VerticalStackLayout x:Name="WindowsPanel" Grid.Row="1" Spacing="8">
@@ -58,6 +58,32 @@
             </Grid>
             <Label x:Name="ReceiverAddressLabel" />
             <Label x:Name="WindowsStatusLabel" Text="Starting secure receiver…" />
+            <Grid ColumnDefinitions="*,*,*,*" ColumnSpacing="6"
+                  HorizontalOptions="Center" WidthRequest="520">
+                <Button Text="↔ Flip" FontSize="12" HeightRequest="32"
+                        MinimumHeightRequest="32" Padding="6,2"
+                        Clicked="OnFlipClicked" />
+                <Button Grid.Column="1" Text="↻ Rotate" FontSize="12"
+                        HeightRequest="32" MinimumHeightRequest="32" Padding="6,2"
+                        Clicked="OnRotateClicked" />
+                <Button Grid.Column="2" Text="▣ Camera" FontSize="12"
+                        HeightRequest="32" MinimumHeightRequest="32" Padding="6,2"
+                        Clicked="OnSwitchCameraClicked" />
+                <Button Grid.Column="3" Text="ϟ Flash" FontSize="12"
+                        HeightRequest="32" MinimumHeightRequest="32" Padding="6,2"
+                        Clicked="OnFlashClicked" />
+            </Grid>
+            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+                <Label x:Name="PairedPhonesLabel"
+                       VerticalTextAlignment="Center"
+                       Text="0 paired phones" />
+                <Button Grid.Column="1"
+                        Text="Allow new phone (60s)"
+                        Clicked="OnAllowNewPhoneClicked" />
+                <Button Grid.Column="2"
+                        Text="Forget phones"
+                        Clicked="OnForgetPhonesClicked" />
+            </Grid>
         </VerticalStackLayout>
 
     </Grid>

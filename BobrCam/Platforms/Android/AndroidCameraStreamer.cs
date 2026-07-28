@@ -51,6 +51,7 @@ public static class AndroidCameraStreamer
     private static CancellationTokenSource? _reconnectCancellation;
     private static Task? _reconnectTask;
     private static Task? _drainTask;
+    private static Task? _controlTask;
     private static bool _wantPreview;
     private static int _displayOrientation;
     private static int _streamFps = FallbackFps;
@@ -63,6 +64,8 @@ public static class AndroidCameraStreamer
     private static int _streamBitrate = FullHdBitrate;
     private static Android.Util.Range? _targetFpsRange;
     private static CameraCharacteristics? _cameraCharacteristics;
+    private static bool _useFrontCamera;
+    private static bool _flashEnabled;
     private static uint _sequence;
 
     public static volatile string? LastError;
@@ -135,6 +138,7 @@ public static class AndroidCameraStreamer
     {
         var previousTask = _reconnectTask;
         _reconnectCancellation?.Cancel();
+        _outputStream?.Dispose();
         if (previousTask is not null)
         {
             try { await previousTask; }
@@ -147,6 +151,54 @@ public static class AndroidCameraStreamer
             () => ReconnectLoopAsync(host, port, discoveredFingerprint, token),
             token);
         await Task.Yield();
+    }
+
+    public static async Task StartAccessoryAsync(System.IO.Stream accessoryStream)
+    {
+        ArgumentNullException.ThrowIfNull(accessoryStream);
+        var previousTask = _reconnectTask;
+        _reconnectCancellation?.Cancel();
+        _outputStream?.Dispose();
+        if (previousTask is not null)
+        {
+            try { await previousTask; }
+            catch (System.OperationCanceledException) { }
+        }
+        _reconnectCancellation?.Dispose();
+        _reconnectCancellation = new CancellationTokenSource();
+        var token = _reconnectCancellation.Token;
+        _reconnectTask = Task.Run(
+            () => RunAccessorySessionAsync(accessoryStream, token),
+            token);
+        await Task.Yield();
+    }
+
+    private static async Task RunAccessorySessionAsync(
+        System.IO.Stream accessoryStream,
+        CancellationToken token)
+    {
+        try
+        {
+            ConnectionStatusChanged?.Invoke(
+                "Connecting by production USB accessory…");
+            await ConnectStreamOnceAsync(accessoryStream, token);
+            if (_drainTask is not null)
+                await MonitorStreamAsync(_drainTask, usb: true, token);
+        }
+        catch (System.OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            Android.Util.Log.Error("BobrCam", ex.ToString());
+            LastError = ex.GetBaseException().Message;
+            ConnectionStatusChanged?.Invoke(
+                $"Production USB disconnected: {LastError}");
+        }
+        finally
+        {
+            await StopStreamingSessionAsync();
+        }
     }
 
     private static async Task ReconnectLoopAsync(
@@ -274,34 +326,82 @@ public static class AndroidCameraStreamer
             Preferences.Default.Set("paired_receiver", presentedFingerprint);
             _outputStream = secure;
         }
-        var authentication = new byte[36];
-        "PCA1"u8.CopyTo(authentication);
-        SecureIdentity.GetOrCreatePairingToken().CopyTo(authentication, 4);
-        await _outputStream.WriteAsync(authentication, _streamCancellation.Token);
-        await _outputStream.FlushAsync(_streamCancellation.Token);
+        await StartProtocolSessionAsync();
+    }
+
+    private static async Task ConnectStreamOnceAsync(
+        System.IO.Stream stream,
+        CancellationToken reconnectToken)
+    {
+        LastError = null;
+        FramesSent = 0;
+        _sequence = 0;
+
+        _streamCancellation?.Cancel();
+        _streamCancellation?.Dispose();
+        _streamCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(reconnectToken);
+        _outputStream?.Dispose();
+        _client?.Dispose();
+        _client = null;
+        _outputStream = stream;
+        await StartProtocolSessionAsync();
+    }
+
+    private static async Task StartProtocolSessionAsync()
+    {
+        var cancellation = _streamCancellation ??
+            throw new InvalidOperationException("Video session is not initialized.");
+        var output = _outputStream ??
+            throw new IOException("Receiver connection is closed.");
+        var challenge = new byte[VideoProtocol.AuthenticationChallengeSize];
+        await output.ReadExactlyAsync(
+            challenge,
+            cancellation.Token);
+        var nonce = new byte[32];
+        if (!VideoProtocol.TryReadAuthenticationChallenge(challenge, nonce))
+            throw new AuthenticationException("Invalid Windows authentication challenge.");
+
+        var authentication = new byte[VideoProtocol.AuthenticationResponseSize];
+        VideoProtocol.WriteAuthenticationResponse(
+            authentication,
+            SecureIdentity.GetOrCreatePairingToken(),
+            nonce);
+        await output.WriteAsync(authentication, cancellation.Token);
+        await output.FlushAsync(cancellation.Token);
         var streamRequest = new byte[VideoProtocol.StreamRequestSize];
-        await _outputStream.ReadExactlyAsync(streamRequest, _streamCancellation.Token);
+        await output.ReadExactlyAsync(streamRequest, cancellation.Token);
         if (!VideoProtocol.TryReadStreamRequest(
                 streamRequest,
                 out var requestedFps,
                 out var requestedWidth,
                 out var requestedHeight,
-                out var prioritizeResolution))
+                out var prioritizeResolution,
+                out var useFrontCamera))
             throw new InvalidDataException("Invalid Windows stream request.");
         _requestedFps = requestedFps;
         _requestedWidth = requestedWidth;
         _requestedHeight = requestedHeight;
         _prioritizeResolution = prioritizeResolution;
+        _useFrontCamera = useFrontCamera;
 
-        await StateGate.WaitAsync(_streamCancellation.Token);
+        await StateGate.WaitAsync(cancellation.Token);
         try
         {
+            _captureSession?.Close();
+            _captureSession?.Dispose();
+            _captureSession = null;
+            _camera?.Close();
+            _camera?.Dispose();
+            _camera = null;
+            _cameraCharacteristics = null;
             StopEncoder();
             await EnsureCameraOpenAsync();
             ConfigureStreamMode();
             StartEncoder();
             await CreateCaptureSessionAsync(streaming: true);
-            _drainTask = Task.Run(() => DrainEncoderAsync(_streamCancellation.Token));
+            _drainTask = Task.Run(() => DrainEncoderAsync(cancellation.Token));
+            _controlTask = Task.Run(() => ReadControlsAsync(cancellation.Token));
         }
         finally
         {
@@ -330,6 +430,7 @@ public static class AndroidCameraStreamer
             _client?.Dispose();
             _client = null;
             _drainTask = null;
+            _controlTask = null;
             if (_wantPreview && _previewOutput is not null)
                 await CreateCaptureSessionAsync(streaming: false);
         }
@@ -377,10 +478,13 @@ public static class AndroidCameraStreamer
         var manager = (CameraManager)context.GetSystemService(Context.CameraService)!;
         var cameraId = manager.GetCameraIdList()
             .FirstOrDefault(id =>
-                (Java.Lang.Integer?)manager.GetCameraCharacteristics(id)
-                    .Get(CameraCharacteristics.LensFacing) ==
-                new Java.Lang.Integer((int)LensFacing.Back))
+                ((Java.Lang.Integer?)manager.GetCameraCharacteristics(id)
+                    .Get(CameraCharacteristics.LensFacing))?.IntValue() ==
+                (int)(_useFrontCamera ? LensFacing.Front : LensFacing.Back))
             ?? manager.GetCameraIdList().First();
+        Android.Util.Log.Info(
+            "BobrCam",
+            $"Opening camera {cameraId} ({(_useFrontCamera ? "front" : "rear")}).");
 
         var completion = new TaskCompletionSource<CameraDevice>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -581,9 +685,64 @@ public static class AndroidCameraStreamer
         foreach (var output in outputs)
             request.AddTarget(output);
         request.Set(CaptureRequest.ControlMode, new Java.Lang.Integer((int)ControlMode.Auto));
+        if (_flashEnabled)
+            request.Set(
+                CaptureRequest.FlashMode,
+                new Java.Lang.Integer((int)Android.Hardware.Camera2.FlashMode.Torch));
         if (_targetFpsRange is not null)
             request.Set(CaptureRequest.ControlAeTargetFpsRange, _targetFpsRange);
         _captureSession.SetRepeatingRequest(request.Build(), null, _cameraHandler);
+    }
+
+    private static async Task ReadControlsAsync(CancellationToken token)
+    {
+        var input = _outputStream ??
+            throw new IOException("Receiver connection is closed.");
+        var message = new byte[VideoProtocol.CameraControlSize];
+        while (!token.IsCancellationRequested)
+        {
+            await input.ReadExactlyAsync(message, token);
+            if (!VideoProtocol.TryReadCameraControl(message, out var command))
+                throw new InvalidDataException("Invalid camera control message.");
+            if (command == CameraControlCommand.SwitchCamera)
+                await SwitchCameraAsync(token);
+            else if (command == CameraControlCommand.ToggleFlash)
+                await ToggleFlashAsync(token);
+        }
+    }
+
+    private static async Task SwitchCameraAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        _useFrontCamera = !_useFrontCamera;
+        _flashEnabled = false;
+        ConnectionStatusChanged?.Invoke(
+            _useFrontCamera
+                ? "Switching to front camera…"
+                : "Switching to rear camera…");
+
+        // Front and rear cameras often expose different supported output sizes.
+        // Closing the transport makes the normal reconnect path rebuild Camera2
+        // and MediaCodec together for the newly selected camera.
+        _outputStream?.Dispose();
+    }
+
+    private static async Task ToggleFlashAsync(CancellationToken token)
+    {
+        await StateGate.WaitAsync(token);
+        try
+        {
+            var available = (Java.Lang.Boolean?)_cameraCharacteristics?.Get(
+                CameraCharacteristics.FlashInfoAvailable);
+            if (available?.BooleanValue() != true)
+                return;
+            _flashEnabled = !_flashEnabled;
+            await CreateCaptureSessionAsync(streaming: _encoderSurface is not null);
+        }
+        finally
+        {
+            StateGate.Release();
+        }
     }
 
     private static async Task DrainEncoderAsync(CancellationToken token)

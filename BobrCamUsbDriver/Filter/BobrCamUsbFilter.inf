@@ -1,0 +1,52 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Extension
+ClassGuid={E2F84CE7-8EFA-411C-AA69-97454CA4CB57}
+ExtensionId={9E2A12F3-48B9-44A7-A061-5C2C6D6A7F3C}
+Provider=%ProviderName%
+DriverVer=07/28/2026,1.0.0.0
+CatalogFile=BobrCamUsbFilter.cat
+PnpLockdown=1
+
+[Manufacturer]
+%ProviderName%=BobrCamModels,NTamd64.10.0...18362
+
+[BobrCamModels.NTamd64.10.0...18362]
+%DeviceDescription%=BobrCamFilterInstall,USB\COMPOSITE
+
+[BobrCamFilterInstall.NT]
+CopyFiles=BobrCamFilterCopyFiles
+
+[BobrCamFilterInstall.NT.Services]
+AddService=BobrCamUsbFilter,0x00000000,BobrCamFilterService
+
+[BobrCamFilterInstall.NT.Filters]
+AddFilter=BobrCamUsbFilter,0,BobrCamUpperFilter
+
+[BobrCamUpperFilter]
+FilterPosition=Upper
+
+[BobrCamFilterService]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\BobrCamUsbFilter.sys
+
+[BobrCamFilterCopyFiles]
+BobrCamUsbFilter.sys
+
+[DestinationDirs]
+BobrCamFilterCopyFiles=13
+
+[SourceDisksFiles]
+BobrCamUsbFilter.sys=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[Strings]
+ProviderName="BobrCam"
+DeviceDescription="BobrCam Android USB activation filter"
+ServiceDescription="BobrCam Android USB activation filter"
+DiskName="BobrCam USB Driver"

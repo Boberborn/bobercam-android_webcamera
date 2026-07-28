@@ -1,0 +1,35 @@
+; Development INF for BobrCam Android Open Accessory bulk transport.
+; A production package must include a Microsoft-signed catalog.
+
+[Version]
+Signature="$Windows NT$"
+Class=USBDevice
+ClassGuid={88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider=%ManufacturerName%
+DriverVer=07/28/2026,1.0.0.0
+CatalogFile=BobrCamUsbAccessory.cat
+
+[Manufacturer]
+%ManufacturerName%=DeviceList,NTamd64
+
+[DeviceList.NTamd64]
+%DeviceName%=WinUSB_Install,USB\VID_18D1&PID_2D00
+%DeviceName%=WinUSB_Install,USB\VID_18D1&PID_2D01
+
+[WinUSB_Install]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[WinUSB_Install.Services]
+Include=winusb.inf
+Needs=WINUSB.NT.Services
+
+[WinUSB_Install.HW]
+AddReg=DeviceInterfaceGUIDs
+
+[DeviceInterfaceGUIDs]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{F3D470C5-1D9E-4D90-A76D-83AF6305218B}"
+
+[Strings]
+ManufacturerName="BobrCam"
+DeviceName="BobrCam Android USB Accessory"

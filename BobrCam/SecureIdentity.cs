@@ -26,7 +26,18 @@ public static class SecureIdentity
     public static byte[] GetOrCreatePairingToken()
     {
         var saved = Preferences.Default.Get("phone_pairing_token", string.Empty);
-        if (!string.IsNullOrEmpty(saved)) return Convert.FromBase64String(saved);
+        if (!string.IsNullOrEmpty(saved))
+        {
+            try
+            {
+                var existing = Convert.FromBase64String(saved);
+                if (existing.Length == 32)
+                    return existing;
+            }
+            catch (FormatException)
+            {
+            }
+        }
         var token = RandomNumberGenerator.GetBytes(32);
         Preferences.Default.Set("phone_pairing_token", Convert.ToBase64String(token));
         return token;

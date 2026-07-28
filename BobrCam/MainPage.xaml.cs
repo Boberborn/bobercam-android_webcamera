@@ -8,6 +8,10 @@ public partial class MainPage : ContentPage
 #endif
     private bool _receiverStarted;
     private bool _updatingStreamSelectors;
+#if WINDOWS
+    private bool _previewMirrored;
+    private int _previewRotation;
+#endif
 #if ANDROID
     private bool _androidAutoConnectStarted;
 #endif
@@ -19,7 +23,7 @@ public partial class MainPage : ContentPage
         AndroidPanel.IsVisible = false;
         WindowsPanel.IsVisible = true;
         WindowsFpsLabel.IsVisible = true;
-        PreviewRow.Height = new GridLength(384);
+        PreviewRow.Height = new GridLength(270);
         WindowsFpsPicker.ItemsSource = new[] { "30 FPS", "60 FPS" };
         WindowsResolutionPicker.ItemsSource = new[] { "720p", "1080p", "2K", "4K" };
         var requestedFps = Preferences.Default.Get("requested_fps", 60);
@@ -85,7 +89,13 @@ public partial class MainPage : ContentPage
             H264PreviewRenderer.Submit(accessUnit);
 #endif
         };
-        _receiver.StatusChanged += status => MainThread.BeginInvokeOnMainThread(() => WindowsStatusLabel.Text = status);
+        _receiver.StatusChanged += status => MainThread.BeginInvokeOnMainThread(() =>
+        {
+            WindowsStatusLabel.Text = status;
+#if WINDOWS
+            UpdatePairedPhonesLabel();
+#endif
+        });
 #if ANDROID
         PreviewImage.IsVisible = false;
         CameraPreview.SurfaceReady += async () =>
@@ -129,13 +139,16 @@ public partial class MainPage : ContentPage
             if (Window is not null)
             {
                 Window.Width = 720;
-                Window.Height = 700;
+                Window.Height = 640;
             }
 #endif
         };
         WindowsIpEntry.Text = NetworkAddress.GetLocalIPv4Address();
         WindowsPortEntry.Text = VideoProtocol.Port.ToString();
         AndroidPortEntry.Text = VideoProtocol.Port.ToString();
+#if WINDOWS
+        UpdatePairedPhonesLabel();
+#endif
     }
 
     protected override async void OnAppearing()
@@ -150,10 +163,17 @@ public partial class MainPage : ContentPage
         if (await Permissions.RequestAsync<Permissions.Camera>() == PermissionStatus.Granted)
         {
             await AndroidCameraStreamer.StartLocalPreviewAsync();
-            if (!_androidAutoConnectStarted && TryGetPort(AndroidPortEntry, out var port))
+            if (!_androidAutoConnectStarted)
             {
                 _androidAutoConnectStarted = true;
-                await ConnectCameraAsync("127.0.0.1", port, string.Empty, "USB");
+                if (TryGetPort(AndroidPortEntry, out var port))
+                {
+                    await ConnectCameraAsync(
+                        "127.0.0.1",
+                        port,
+                        string.Empty,
+                        "USB (ADB)");
+                }
             }
         }
 #endif
@@ -163,7 +183,8 @@ public partial class MainPage : ContentPage
     {
 #if ANDROID
         if (!TryGetPort(AndroidPortEntry, out var port)) return;
-        await ConnectCameraAsync("127.0.0.1", port, string.Empty, "USB");
+        AndroidStatusLabel.Text = "Connecting by USB debugging…";
+        await ConnectCameraAsync("127.0.0.1", port, string.Empty, "USB (ADB)");
 #endif
     }
 
@@ -257,6 +278,82 @@ public partial class MainPage : ContentPage
 #endif
     }
 
+    private void OnAllowNewPhoneClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        _receiver.AllowNewPhone(TimeSpan.FromSeconds(60));
+#endif
+    }
+
+    private async void OnForgetPhonesClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        var confirmed = await DisplayAlert(
+            "Forget paired phones?",
+            "Every phone must be paired again. A phone connected by USB can pair automatically.",
+            "Forget",
+            "Cancel");
+        if (!confirmed)
+            return;
+        _receiver.ForgetPairedPhones();
+        UpdatePairedPhonesLabel();
+#endif
+    }
+
+    private void OnFlipClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        _previewMirrored = !_previewMirrored;
+        H264PreviewRenderer.SetPreviewTransform(
+            _previewMirrored,
+            _previewRotation);
+#endif
+    }
+
+    private void OnRotateClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        _previewRotation = (_previewRotation + 90) % 360;
+        H264PreviewRenderer.SetPreviewTransform(
+            _previewMirrored,
+            _previewRotation);
+#endif
+    }
+
+    private async void OnSwitchCameraClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        _receiver.TogglePhoneCamera();
+        await Task.CompletedTask;
+#endif
+    }
+
+    private async void OnFlashClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        await SendCameraControlAsync(
+            CameraControlCommand.ToggleFlash,
+            "Toggling phone flash…");
+#endif
+    }
+
+#if WINDOWS
+    private async Task SendCameraControlAsync(
+        CameraControlCommand command,
+        string status)
+    {
+        try
+        {
+            WindowsStatusLabel.Text = status;
+            await _receiver.SendCameraControlAsync(command);
+        }
+        catch (Exception ex)
+        {
+            WindowsStatusLabel.Text = ex.GetBaseException().Message;
+        }
+    }
+#endif
+
     private async void OnWindowsFpsChanged(object sender, EventArgs e)
     {
 #if WINDOWS
@@ -323,15 +420,21 @@ public partial class MainPage : ContentPage
         try
         {
             await _receiver.StartAsync(bindAddress, port);
-            _adbReverseManager.Start(port);
+            _adbReverseManager.Start(port, VideoProtocol.UsbHostPort);
             _receiverStarted = true;
-            ReceiverAddressLabel.Text = $"Listening on {bindAddress}:{port}";
+            ReceiverAddressLabel.Text =
+                $"Wi-Fi TLS: {bindAddress}:{port} · USB ADB: 127.0.0.1:{VideoProtocol.UsbHostPort}";
+            UpdatePairedPhonesLabel();
         }
         catch (Exception ex)
         {
             WindowsStatusLabel.Text = $"Receiver error: {ex.Message}";
         }
     }
+
+    private void UpdatePairedPhonesLabel() =>
+        PairedPhonesLabel.Text =
+            $"{_receiver.PairedPhoneCount} paired phone(s)";
 #endif
 
     protected override async void OnDisappearing()

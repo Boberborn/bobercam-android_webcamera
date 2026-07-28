@@ -7,21 +7,29 @@ internal sealed class AdbReverseManager : IAsyncDisposable
 {
     private CancellationTokenSource? _cancellation;
     private Task? _monitorTask;
-    private int _port;
+    private int _devicePort;
+    private int _hostPort;
 
-    public void Start(int port)
+    public void Start(int devicePort, int hostPort)
     {
-        if (_monitorTask is { IsCompleted: false } && _port == port)
+        if (_monitorTask is { IsCompleted: false } &&
+            _devicePort == devicePort &&
+            _hostPort == hostPort)
             return;
 
         _cancellation?.Cancel();
         _cancellation?.Dispose();
-        _port = port;
+        _devicePort = devicePort;
+        _hostPort = hostPort;
         _cancellation = new CancellationTokenSource();
-        _monitorTask = Task.Run(() => MonitorAsync(port, _cancellation.Token));
+        _monitorTask = Task.Run(
+            () => MonitorAsync(devicePort, hostPort, _cancellation.Token));
     }
 
-    private static async Task MonitorAsync(int port, CancellationToken token)
+    private static async Task MonitorAsync(
+        int devicePort,
+        int hostPort,
+        CancellationToken token)
     {
         while (!token.IsCancellationRequested)
         {
@@ -29,7 +37,13 @@ internal sealed class AdbReverseManager : IAsyncDisposable
             {
                 var devices = await GetConnectedDevicesAsync(token);
                 foreach (var serial in devices)
-                    await EnsureReverseRuleAsync(serial, port, token);
+                {
+                    await EnsureReverseRuleAsync(
+                        serial,
+                        devicePort,
+                        hostPort,
+                        token);
+                }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
@@ -69,21 +83,23 @@ internal sealed class AdbReverseManager : IAsyncDisposable
 
     private static async Task EnsureReverseRuleAsync(
         string serial,
-        int port,
+        int devicePort,
+        int hostPort,
         CancellationToken token)
     {
-        var endpoint = $"tcp:{port}";
+        var deviceEndpoint = $"tcp:{devicePort}";
+        var hostEndpoint = $"tcp:{hostPort}";
         var list = await RunAdbAsync(["-s", serial, "reverse", "--list"], token);
         if (list.ExitCode == 0 &&
             list.StandardOutput.Contains(
-                $"{endpoint} {endpoint}",
+                $"{deviceEndpoint} {hostEndpoint}",
                 StringComparison.Ordinal))
         {
             return;
         }
 
         var apply = await RunAdbAsync(
-            ["-s", serial, "reverse", endpoint, endpoint],
+            ["-s", serial, "reverse", deviceEndpoint, hostEndpoint],
             token);
         if (apply.ExitCode != 0)
             Debug.WriteLine(

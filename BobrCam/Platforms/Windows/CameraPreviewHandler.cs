@@ -90,6 +90,23 @@ public static class H264PreviewRenderer
         queue?.Writer.TryWrite(accessUnit);
     }
 
+    public static void SetPreviewTransform(bool mirrored, int rotationDegrees)
+    {
+        var dispatcher = _dispatcher;
+        if (dispatcher is null) return;
+        dispatcher.TryEnqueue(() =>
+        {
+            if (_image is null) return;
+            _image.RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5);
+            _image.RenderTransform = new Microsoft.UI.Xaml.Media.CompositeTransform
+            {
+                ScaleX = mirrored ? -1 : 1,
+                ScaleY = 1,
+                Rotation = rotationDegrees
+            };
+        });
+    }
+
     private static async Task DecodeLoopAsync(
         H264StreamConfiguration configuration,
         ChannelReader<EncodedVideoAccessUnit> reader,

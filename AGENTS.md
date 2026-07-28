@@ -47,7 +47,7 @@ dotnet build .\BobrCam.csproj -f net10.0-android   # Android
 dotnet build .\BobrCam.csproj -f net10.0-windows10.0.19041.0  # Windows
 msbuild .\BobrCam.csproj          # MSBuild alternative
 adb devices                        # check phone connection
-adb reverse tcp:28444 tcp:28444    # USB tunnel
+adb reverse tcp:28444 tcp:28446    # USB tunnel: phone port -> local-only PC port
 gh pr create / gh pr checkout      # GitHub workflow
 docker ps                          # container management
 ```
@@ -129,17 +129,47 @@ When updating the Android app on a phone:
 - Unused historical `lumiflow_*` assets may remain if unreferenced.
 
 ## Connection and security invariants
-- Transport is TLS 1.2 over TCP.
+- Wi-Fi transport is TLS 1.2 over TCP.
 - Windows advertises its local certificate SHA-256 fingerprint through UDP discovery.
 - Android pins the fingerprint after first pairing.
-- Android sends a per-install 32-byte pairing token after the TLS handshake.
-- Windows stores the first token and rejects different phones afterward.
+- Windows sends a fresh 32-byte nonce and Android proves possession of its
+  per-install token with HMAC-SHA256.
+- Windows stores token hashes for multiple paired phones. Unknown Wi-Fi phones
+  are accepted only while the user opens the 60-second pairing window.
 - Wi-Fi uses UDP discovery or manual IP/port.
-- USB uses ADB reverse so Android connects to `127.0.0.1`.
+- Wi-Fi may bind only to a selected private IPv4 address.
+- The unencrypted USB endpoint binds only to `127.0.0.1:28446`.
+- ADB reverse is the current working USB fallback. Android connects to its local
+  port `28444`, which maps to Windows port `28446`.
+- Initial Wi-Fi certificate pairing remains trust-on-first-use. A release still
+  needs explicit short-code or QR confirmation on both devices to prevent a
+  same-LAN discovery race.
 
 ```powershell
-adb reverse tcp:28444 tcp:28444
+adb reverse tcp:28444 tcp:28446
 ```
+
+Production no-debug USB is partially implemented:
+
+- `Platforms/Android/AndroidUsbAccessoryTransport.cs` opens Android Open
+  Accessory bulk streams and reuses the existing H.264 sender.
+- `Platforms/Windows/ProductionUsbHostManager.cs` detects accessory-mode
+  `18D1:2D00/2D01` devices and bridges WinUSB to the local authenticated receiver.
+- `Platforms/Windows/AndroidOpenAccessoryActivator.cs` implements AOA protocol
+  requests 51/52/53 for Android interfaces that Windows already exposes through
+  WinUSB, then the existing accessory bridge takes over after re-enumeration.
+- `Platforms/Windows/BobrCamUsbFilterClient.cs` opens the BobrCam filter device
+  interface and requests AOA activation before the WinUSB/MTP fallback.
+- `BobrCamUsbDriver/Filter/` contains a KMDF pass-through upper filter, a
+  signability-validated extension INF, and the shared IOCTL contract. It attaches
+  to USB composite devices but exposes its interface only for recognized Android
+  vendor IDs.
+- `BobrCamUsbDriver/BobrCamUsbAccessory.inf` is a development INF only.
+- `BobrCamUsbDriver/Build-BobrCamUsbFilter.ps1` restores WDK 26100.6584, compiles
+  and links the x64 driver, validates the INF, and generates an unsigned catalog.
+- Remaining external blocker: Microsoft production-sign the driver package and
+  test installation, MTP activation, and charge-only activation on clean Windows
+  systems. Do not claim no-debug USB is release-complete before those tests pass.
 
 Never weaken certificate pinning or pairing-token validation to fix connections. First check ADB reverse, firewall, IP, port, and stale pairing data.
 Changing the Android app ID or certificate filename can require reinstalling and pairing again.

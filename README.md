@@ -2,14 +2,14 @@
 
 **Free Webcam for OBS & PC** — turns your Android phone into a Windows webcam.
 
-Use your phone's camera as a high-quality video source for OBS, Zoom, Teams, browsers, or the Windows Camera app. BobrCam streams encrypted video over Wi-Fi or USB with near-zero latency.
+Use your phone's camera as a high-quality video source for OBS, Zoom, Teams, browsers, or the Windows Camera app. BobrCam streams authenticated H.264 over Wi-Fi or USB with low latency.
 
 ## Features
 
 - **Full HD 60fps** camera streaming (resolves to best available resolution on your device)
-- **End-to-end TLS 1.2** encryption with certificate fingerprint verification
+- **TLS 1.2 Wi-Fi** encryption with certificate fingerprint verification
 - **Wi-Fi** — auto-discovery via UDP broadcast or manual IP/port entry
-- **USB** — use `adb reverse` for zero-latency wired connection
+- **USB (ADB)** — local-only wired transport; enable USB debugging and authorize the PC
 - **Virtual camera** — appears as `BobrCam (Windows Virtual Camera)` in any app
 - **Live phone preview** — hardware-accelerated camera preview on the phone using `TextureView`
 - **Auto-fit window** — PC preview window resizes to match the exact camera resolution
@@ -54,7 +54,7 @@ dotnet build .\BobrCam\BobrCam.csproj -f net10.0-windows10.0.19041.0 -m:1 -p:Use
 
 **USB:**
 ```powershell
-adb reverse tcp:28444 tcp:28444
+adb reverse tcp:28444 tcp:28446
 ```
 Then tap **Connect USB** on the phone.
 
@@ -73,7 +73,34 @@ Once connected, `BobrCam (Windows Virtual Camera)` appears in the camera list of
 ## Security
 
 - TLS 1.2 with per-receiver certificate pinning
-- Per-install 32-byte pairing token — only one phone per Windows receiver
+- Nonce-based phone authentication prevents replaying captured handshakes
+- Multiple phone identities can be remembered; new Wi-Fi phones require a 60-second pairing window
+- Wi-Fi binds only to a selected private IPv4 address
+- Plain USB traffic terminates only on the Windows loopback listener at `127.0.0.1:28446`
+- Strict packet sizes, stream limits, timeouts, concurrent-handshake limits, and failed-authentication rate limits
+
+Initial Wi-Fi certificate pairing is currently trust-on-first-use. Before a
+public release, add an on-screen short-code or QR confirmation so an active
+attacker on the same LAN cannot race the first discovery response.
+
+## Future charge-only USB support
+
+The Android Open Accessory endpoint, Windows AOA activation sequence, WinUSB bulk
+bridge, and KMDF upper-filter source are kept for future work. They are not enabled
+in the current BobrCam release; ADB is the supported wired transport.
+
+Build the x64 filter package with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  .\BobrCamUsbDriver\Build-BobrCamUsbFilter.ps1 -Configuration Release
+```
+
+The build compiles and links `BobrCamUsbFilter.sys`, validates the INF, and
+generates an unsigned catalog under
+`BobrCamUsbDriver\Filter\bin\x64\Release\`. Do not install that development
+package on user machines. The catalog and driver still require Microsoft
+production signing, followed by clean-machine MTP and charge-only tests.
 - Certificate fingerprint advertised over UDP (not trusted without pairing)
 
 ## License
