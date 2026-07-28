@@ -23,6 +23,10 @@ public sealed class VideoReceiver
     public event Action<H264StreamConfiguration, byte[]>? StreamConfigured;
     public event Action<EncodedVideoAccessUnit>? AccessUnitReceived;
     public event Action<string>? StatusChanged;
+    public byte RequestedFrameRate { get; set; } = 60;
+    public ushort RequestedWidth { get; set; } = 1920;
+    public ushort RequestedHeight { get; set; } = 1080;
+    public bool PrioritizeResolution { get; set; }
 
     public Task StartAsync(string bindAddress, int port)
     {
@@ -106,6 +110,13 @@ public sealed class VideoReceiver
                 }
                 var pairingToken =
                     await ValidatePhoneHandshakeAsync(transport, handshakeTimeout.Token);
+                await SendStreamRequestAsync(
+                    transport,
+                    RequestedFrameRate,
+                    RequestedWidth,
+                    RequestedHeight,
+                    PrioritizeResolution,
+                    handshakeTimeout.Token);
 
                 connectionCancellation =
                     CancellationTokenSource.CreateLinkedTokenSource(receiverToken);
@@ -192,6 +203,26 @@ public sealed class VideoReceiver
         if (message.AsSpan(4, 32).IndexOfAnyExcept((byte)0) < 0)
             throw new AuthenticationException("Invalid phone authentication token.");
         return message[4..];
+    }
+
+    private static async Task SendStreamRequestAsync(
+        Stream stream,
+        byte frameRate,
+        ushort width,
+        ushort height,
+        bool prioritizeResolution,
+        CancellationToken token)
+    {
+        var message = new byte[VideoProtocol.StreamRequestSize];
+        if (!VideoProtocol.TryWriteStreamRequest(
+                message,
+                frameRate,
+                width,
+                height,
+                prioritizeResolution))
+            throw new InvalidOperationException("Invalid requested stream mode.");
+        await stream.WriteAsync(message, token);
+        await stream.FlushAsync(token);
     }
 
     private async Task ReadPacketsAsync(Stream stream, CancellationToken token)

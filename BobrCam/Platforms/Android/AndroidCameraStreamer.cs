@@ -9,6 +9,7 @@ using Android.App;
 using Android.Content;
 using Android.Graphics;
 using Android.Hardware.Camera2;
+using Android.Hardware.Camera2.Params;
 using Android.Media;
 using Android.OS;
 using Android.Views;
@@ -18,11 +19,20 @@ namespace BobrCam;
 
 public static class AndroidCameraStreamer
 {
-    private const int TargetWidth = 1920;
-    private const int TargetHeight = 1080;
+    private const int FullHdWidth = 1920;
+    private const int FullHdHeight = 1080;
+    private const int HdWidth = 1280;
+    private const int HdHeight = 720;
+    private const int QuadHdWidth = 2560;
+    private const int QuadHdHeight = 1440;
+    private const int UltraHdWidth = 3840;
+    private const int UltraHdHeight = 2160;
     private const int PreferredFps = 60;
     private const int FallbackFps = 30;
-    private const int TargetBitrate = 16_000_000;
+    private const int FullHdBitrate = 16_000_000;
+    private const int HdBitrate = 8_000_000;
+    private const int QuadHdBitrate = 24_000_000;
+    private const int UltraHdBitrate = 35_000_000;
 
     private static readonly SemaphoreSlim StateGate = new(1, 1);
     private static readonly SemaphoreSlim WriteGate = new(1, 1);
@@ -44,7 +54,15 @@ public static class AndroidCameraStreamer
     private static bool _wantPreview;
     private static int _displayOrientation;
     private static int _streamFps = FallbackFps;
+    private static int _requestedFps = PreferredFps;
+    private static int _requestedWidth = FullHdWidth;
+    private static int _requestedHeight = FullHdHeight;
+    private static bool _prioritizeResolution;
+    private static int _streamWidth = FullHdWidth;
+    private static int _streamHeight = FullHdHeight;
+    private static int _streamBitrate = FullHdBitrate;
     private static Android.Util.Range? _targetFpsRange;
+    private static CameraCharacteristics? _cameraCharacteristics;
     private static uint _sequence;
 
     public static volatile string? LastError;
@@ -61,10 +79,10 @@ public static class AndroidCameraStreamer
             return;
         }
 
-        surface.SetDefaultBufferSize(TargetWidth, TargetHeight);
+        surface.SetDefaultBufferSize(FullHdWidth, FullHdHeight);
         _previewOutput?.Dispose();
         _previewOutput = new Surface(surface);
-        onReady?.Invoke(_displayOrientation, TargetWidth, TargetHeight);
+        onReady?.Invoke(_displayOrientation, FullHdWidth, FullHdHeight);
         if (_wantPreview)
             _ = ReconfigureCameraAsync();
     }
@@ -76,13 +94,13 @@ public static class AndroidCameraStreamer
     {
         if (_displayOrientation is 90 or 270)
         {
-            width = TargetHeight;
-            height = TargetWidth;
+            width = FullHdHeight;
+            height = FullHdWidth;
         }
         else
         {
-            width = TargetWidth;
-            height = TargetHeight;
+            width = FullHdWidth;
+            height = FullHdHeight;
         }
     }
 
@@ -158,6 +176,7 @@ public static class AndroidCameraStreamer
             }
             catch (Exception ex)
             {
+                Android.Util.Log.Error("BobrCam", ex.ToString());
                 LastError = ex.GetBaseException().Message;
                 ConnectionStatusChanged?.Invoke(
                     $"Disconnected: {LastError} Retrying in {retryDelay.TotalSeconds:0}s…");
@@ -260,12 +279,26 @@ public static class AndroidCameraStreamer
         SecureIdentity.GetOrCreatePairingToken().CopyTo(authentication, 4);
         await _outputStream.WriteAsync(authentication, _streamCancellation.Token);
         await _outputStream.FlushAsync(_streamCancellation.Token);
+        var streamRequest = new byte[VideoProtocol.StreamRequestSize];
+        await _outputStream.ReadExactlyAsync(streamRequest, _streamCancellation.Token);
+        if (!VideoProtocol.TryReadStreamRequest(
+                streamRequest,
+                out var requestedFps,
+                out var requestedWidth,
+                out var requestedHeight,
+                out var prioritizeResolution))
+            throw new InvalidDataException("Invalid Windows stream request.");
+        _requestedFps = requestedFps;
+        _requestedWidth = requestedWidth;
+        _requestedHeight = requestedHeight;
+        _prioritizeResolution = prioritizeResolution;
 
         await StateGate.WaitAsync(_streamCancellation.Token);
         try
         {
             StopEncoder();
             await EnsureCameraOpenAsync();
+            ConfigureStreamMode();
             StartEncoder();
             await CreateCaptureSessionAsync(streaming: true);
             _drainTask = Task.Run(() => DrainEncoderAsync(_streamCancellation.Token));
@@ -353,35 +386,161 @@ public static class AndroidCameraStreamer
             TaskCreationOptions.RunContinuationsAsynchronously);
         manager.OpenCamera(cameraId, new DeviceStateCallback(completion), _cameraHandler);
         _camera = await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        _targetFpsRange = DetermineFrameRate(manager.GetCameraCharacteristics(cameraId));
+        _cameraCharacteristics = manager.GetCameraCharacteristics(cameraId);
+        ConfigureStreamMode();
+    }
+
+    private static void ConfigureStreamMode()
+    {
+        var characteristics = _cameraCharacteristics
+            ?? throw new InvalidOperationException("Camera characteristics are unavailable.");
+        (_streamWidth, _streamHeight) = SelectSupportedResolution(
+            characteristics,
+            _requestedWidth,
+            _requestedHeight);
+        if (!_prioritizeResolution &&
+            _requestedFps >= PreferredFps &&
+            !SupportsFrameRate(
+                characteristics,
+                _streamWidth,
+                _streamHeight,
+                _requestedFps))
+        {
+            (_streamWidth, _streamHeight) = SelectSupportedResolution(
+                characteristics,
+                HdWidth,
+                HdHeight);
+        }
+        _targetFpsRange = DetermineFrameRate(
+            characteristics,
+            _requestedFps,
+            _streamWidth,
+            _streamHeight);
         _streamFps = _targetFpsRange is null
             ? FallbackFps
             : Convert.ToInt32(_targetFpsRange.Upper);
+        _streamBitrate = _streamHeight switch
+        {
+            >= UltraHdHeight => UltraHdBitrate,
+            >= QuadHdHeight => QuadHdBitrate,
+            <= HdHeight => HdBitrate,
+            _ => FullHdBitrate
+        };
     }
 
-    private static Android.Util.Range? DetermineFrameRate(CameraCharacteristics characteristics)
+    private static Android.Util.Range? DetermineFrameRate(
+        CameraCharacteristics characteristics,
+        int requestedFps,
+        int width,
+        int height)
     {
-        var ranges = (Android.Util.Range[]?)characteristics.Get(
-            CameraCharacteristics.ControlAeAvailableTargetFpsRanges);
-        if (ranges is null || ranges.Length == 0) return null;
+        var durationLimit = GetMaximumFrameRate(characteristics, width, height);
+        Android.Util.Range[]? ranges;
+        try
+        {
+            ranges = (Android.Util.Range[]?)characteristics.Get(
+                CameraCharacteristics.ControlAeAvailableTargetFpsRanges);
+        }
+        catch (InvalidCastException)
+        {
+            ranges = null;
+        }
+        if (ranges is null || ranges.Length == 0)
+        {
+            var compatibleMaximum = durationLimit > 0
+                ? Math.Min(requestedFps, durationLimit)
+                : Math.Min(requestedFps, FallbackFps);
+            if (!OperatingSystem.IsAndroidVersionAtLeast(28))
+                compatibleMaximum = Math.Min(compatibleMaximum, FallbackFps);
+            var value = new Java.Lang.Integer(Math.Max(1, compatibleMaximum));
+            return new Android.Util.Range(value, value);
+        }
+        var maximum = durationLimit > 0
+            ? Math.Min(requestedFps, durationLimit)
+            : requestedFps;
         return ranges
-            .Where(range => Convert.ToInt32(range.Upper) <= PreferredFps)
+            .Where(range => Convert.ToInt32(range.Upper) <= maximum)
             .OrderByDescending(range => Convert.ToInt32(range.Upper))
             .ThenByDescending(range => Convert.ToInt32(range.Lower))
             .FirstOrDefault()
-            ?? ranges.OrderByDescending(range => Convert.ToInt32(range.Upper)).First();
+            ?? ranges.OrderBy(range => Convert.ToInt32(range.Upper)).First();
+    }
+
+    private static (int Width, int Height) SelectSupportedResolution(
+        CameraCharacteristics characteristics,
+        int requestedWidth,
+        int requestedHeight)
+    {
+        var map = (StreamConfigurationMap?)characteristics.Get(
+            CameraCharacteristics.ScalerStreamConfigurationMap);
+        var sizes = map?.GetOutputSizes(
+            Java.Lang.Class.FromType(typeof(SurfaceTexture)));
+        if (sizes is null || sizes.Length == 0)
+            return (FullHdWidth, FullHdHeight);
+
+        var exact = sizes.FirstOrDefault(size =>
+            size.Width == requestedWidth && size.Height == requestedHeight);
+        if (exact is not null)
+            return (exact.Width, exact.Height);
+
+        var requestedPixels = (long)requestedWidth * requestedHeight;
+        var fallback = sizes
+            .Where(size =>
+                size.Width * 9L == size.Height * 16L &&
+                (long)size.Width * size.Height <= requestedPixels)
+            .OrderByDescending(size => (long)size.Width * size.Height)
+            .FirstOrDefault()
+            ?? sizes.OrderBy(size =>
+                Math.Abs((long)size.Width * size.Height - requestedPixels))
+                .First();
+        return (fallback.Width, fallback.Height);
+    }
+
+    private static bool SupportsFrameRate(
+        CameraCharacteristics characteristics,
+        int width,
+        int height,
+        int frameRate)
+    {
+        var maximum = GetMaximumFrameRate(characteristics, width, height);
+        return maximum >= frameRate;
+    }
+
+    private static int GetMaximumFrameRate(
+        CameraCharacteristics characteristics,
+        int width,
+        int height)
+    {
+        var map = (StreamConfigurationMap?)characteristics.Get(
+            CameraCharacteristics.ScalerStreamConfigurationMap);
+        if (map is null) return 0;
+        try
+        {
+            var duration = map.GetOutputMinFrameDuration(
+                Java.Lang.Class.FromType(typeof(SurfaceTexture)),
+                new Android.Util.Size(width, height));
+            return duration > 0
+                ? (int)(1_000_000_000L / duration)
+                : 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private static void StartEncoder()
     {
-        var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, TargetWidth, TargetHeight);
+        var format = MediaFormat.CreateVideoFormat(
+            MediaFormat.MimetypeVideoAvc,
+            _streamWidth,
+            _streamHeight);
         format.SetInteger(MediaFormat.KeyColorFormat, (int)MediaCodecCapabilities.Formatsurface);
-        format.SetInteger(MediaFormat.KeyBitRate, TargetBitrate);
+        format.SetInteger(MediaFormat.KeyBitRate, _streamBitrate);
         format.SetInteger(MediaFormat.KeyFrameRate, _streamFps);
         format.SetInteger(MediaFormat.KeyIFrameInterval, 1);
         format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilemain);
-        format.SetInteger(MediaFormat.KeyLevel,
-            (int)(_streamFps >= PreferredFps ? MediaCodecProfileLevel.Avclevel42 : MediaCodecProfileLevel.Avclevel41));
+        format.SetInteger(MediaFormat.KeyLevel, (int)GetEncoderLevel());
         if (OperatingSystem.IsAndroidVersionAtLeast(29))
             format.SetInteger(MediaFormat.KeyMaxBFrames, 0);
 
@@ -567,13 +726,13 @@ public static class AndroidCameraStreamer
     private static async Task SendConfigurationAsync(byte[] codecData, CancellationToken token)
     {
         var configuration = new H264StreamConfiguration(
-            TargetWidth,
-            TargetHeight,
+            (ushort)_streamWidth,
+            (ushort)_streamHeight,
             (ushort)_streamFps,
             1,
-            TargetBitrate,
+            (uint)_streamBitrate,
             H264Profile.Main,
-            (byte)(_streamFps >= PreferredFps ? 42 : 41),
+            GetProtocolLevel(),
             8,
             H264ChromaFormat.Yuv420,
             1000,
@@ -590,6 +749,38 @@ public static class AndroidCameraStreamer
             0,
             0,
             token);
+    }
+
+    private static MediaCodecProfileLevel GetEncoderLevel()
+    {
+        if (_streamHeight >= UltraHdHeight)
+            return _streamFps >= PreferredFps
+                ? MediaCodecProfileLevel.Avclevel52
+                : MediaCodecProfileLevel.Avclevel51;
+        if (_streamHeight >= QuadHdHeight)
+            return _streamFps >= PreferredFps
+                ? MediaCodecProfileLevel.Avclevel51
+                : MediaCodecProfileLevel.Avclevel5;
+        if (_streamHeight <= HdHeight && _streamFps >= PreferredFps)
+            return MediaCodecProfileLevel.Avclevel4;
+        if (_streamFps >= PreferredFps)
+            return MediaCodecProfileLevel.Avclevel42;
+        return OperatingSystem.IsAndroidVersionAtLeast(28)
+            ? MediaCodecProfileLevel.Avclevel41
+            : MediaCodecProfileLevel.Avclevel4;
+    }
+
+    private static byte GetProtocolLevel()
+    {
+        if (_streamHeight >= UltraHdHeight)
+            return _streamFps >= PreferredFps ? (byte)52 : (byte)51;
+        if (_streamHeight >= QuadHdHeight)
+            return _streamFps >= PreferredFps ? (byte)51 : (byte)50;
+        if (_streamHeight <= HdHeight && _streamFps >= PreferredFps)
+            return 40;
+        if (_streamFps >= PreferredFps)
+            return 42;
+        return OperatingSystem.IsAndroidVersionAtLeast(28) ? (byte)41 : (byte)40;
     }
 
     private static async Task SendPacketAsync(

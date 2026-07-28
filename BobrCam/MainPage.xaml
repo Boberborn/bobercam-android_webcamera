@@ -4,11 +4,15 @@
              xmlns:local="clr-namespace:BobrCam"
              x:Class="BobrCam.MainPage"
              Title="BobrCam">
-    <Grid Padding="24" RowDefinitions="*,Auto" RowSpacing="18"
+    <Grid Padding="24" RowSpacing="18"
           BackgroundColor="{AppThemeBinding Light=#FFF8F2, Dark=#211918}">
+        <Grid.RowDefinitions>
+            <RowDefinition x:Name="PreviewRow" Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
         <Border Grid.Row="0" Stroke="#F45145" StrokeThickness="2" StrokeShape="RoundRectangle 16" BackgroundColor="Black">
             <Grid>
-                <Image x:Name="PreviewImage" Aspect="AspectFit" BackgroundColor="Black" />
+                <Image x:Name="PreviewImage" Aspect="AspectFill" BackgroundColor="Black" />
                 <local:CameraPreview x:Name="CameraPreview" BackgroundColor="Black" />
                 <Label x:Name="WindowsFpsLabel"
                        Text="0.0 FPS"
@@ -39,10 +43,18 @@
 
         <VerticalStackLayout x:Name="WindowsPanel" Grid.Row="1" Spacing="8">
             <Label Text="Windows receiver" FontAttributes="Bold" FontSize="18" />
-            <Grid ColumnDefinitions="*,120,Auto" ColumnSpacing="10">
+            <Grid ColumnDefinitions="*,110,110,120,Auto" ColumnSpacing="10">
                 <Entry x:Name="WindowsIpEntry" Placeholder="Listen IP" Keyboard="Url" />
                 <Entry x:Name="WindowsPortEntry" Grid.Column="1" Text="28444" Placeholder="Port" Keyboard="Numeric" />
-                <Button Grid.Column="2" Text="Apply" Clicked="OnApplyReceiverClicked" />
+                <Picker x:Name="WindowsFpsPicker"
+                        Grid.Column="2"
+                        Title="FPS"
+                        SelectedIndexChanged="OnWindowsFpsChanged" />
+                <Picker x:Name="WindowsResolutionPicker"
+                        Grid.Column="3"
+                        Title="Resolution"
+                        SelectedIndexChanged="OnWindowsResolutionChanged" />
+                <Button Grid.Column="4" Text="Apply" Clicked="OnApplyReceiverClicked" />
             </Grid>
             <Label x:Name="ReceiverAddressLabel" />
             <Label x:Name="WindowsStatusLabel" Text="Starting secure receiver…" />

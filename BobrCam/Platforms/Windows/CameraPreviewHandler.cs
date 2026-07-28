@@ -21,7 +21,9 @@ public sealed class CameraPreviewHandler
     {
         var image = new Microsoft.UI.Xaml.Controls.Image
         {
-            Stretch = Microsoft.UI.Xaml.Media.Stretch.Uniform
+            Stretch = Microsoft.UI.Xaml.Media.Stretch.UniformToFill,
+            HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Center,
+            VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Center
         };
         var grid = new Microsoft.UI.Xaml.Controls.Grid();
         grid.Children.Add(image);

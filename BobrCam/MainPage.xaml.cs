@@ -3,8 +3,11 @@ namespace BobrCam;
 public partial class MainPage : ContentPage
 {
     private readonly VideoReceiver _receiver = new();
+#if WINDOWS
+    private readonly AdbReverseManager _adbReverseManager = new();
+#endif
     private bool _receiverStarted;
-    private bool _fitWindowOnce = true;
+    private bool _updatingStreamSelectors;
 #if ANDROID
     private bool _androidAutoConnectStarted;
 #endif
@@ -16,6 +19,23 @@ public partial class MainPage : ContentPage
         AndroidPanel.IsVisible = false;
         WindowsPanel.IsVisible = true;
         WindowsFpsLabel.IsVisible = true;
+        PreviewRow.Height = new GridLength(384);
+        WindowsFpsPicker.ItemsSource = new[] { "30 FPS", "60 FPS" };
+        WindowsResolutionPicker.ItemsSource = new[] { "720p", "1080p", "2K", "4K" };
+        var requestedFps = Preferences.Default.Get("requested_fps", 60);
+        var requestedHeight = Preferences.Default.Get("requested_height", 1080);
+        _updatingStreamSelectors = true;
+        WindowsFpsPicker.SelectedIndex = requestedFps == 30 ? 0 : 1;
+        WindowsResolutionPicker.SelectedIndex = requestedHeight switch
+        {
+            720 => 0,
+            1440 => 2,
+            2160 => 3,
+            _ => 1
+        };
+        _updatingStreamSelectors = false;
+        _receiver.RequestedFrameRate = (byte)(requestedFps == 30 ? 30 : 60);
+        SetRequestedResolution(requestedHeight);
         H264PreviewRenderer.StatusChanged += status =>
             MainThread.BeginInvokeOnMainThread(() => WindowsStatusLabel.Text = status);
         H264PreviewRenderer.FpsChanged += fps =>
@@ -37,20 +57,26 @@ public partial class MainPage : ContentPage
         {
 #if WINDOWS
             H264PreviewRenderer.Configure(configuration, codecData);
-            if (_fitWindowOnce)
+            MainThread.BeginInvokeOnMainThread(() =>
             {
-                _fitWindowOnce = false;
-                var w = configuration.Width;
-                var h = configuration.Height;
-                MainThread.BeginInvokeOnMainThread(() =>
+                _updatingStreamSelectors = true;
+                var actualFps = (int)Math.Round(
+                    (double)configuration.FrameRateNumerator /
+                    configuration.FrameRateDenominator);
+                WindowsFpsPicker.SelectedIndex = actualFps >= 60 ? 1 : 0;
+                WindowsResolutionPicker.SelectedIndex = configuration.Height switch
                 {
-                    if (Window is not null)
-                    {
-                        Window.Width = Math.Min(w + 96, 1600);
-                        Window.Height = Math.Min(h + 200, 1000);
-                    }
-                });
-            }
+                    <= 720 => 0,
+                    >= 2160 => 3,
+                    >= 1440 => 2,
+                    _ => 1
+                };
+                _receiver.RequestedFrameRate = (byte)(actualFps >= 60 ? 60 : 30);
+                SetRequestedResolution(configuration.Height);
+                Preferences.Default.Set("requested_fps", (int)_receiver.RequestedFrameRate);
+                Preferences.Default.Set("requested_height", (int)_receiver.RequestedHeight);
+                _updatingStreamSelectors = false;
+            });
 #endif
         };
         _receiver.AccessUnitReceived += accessUnit =>
@@ -102,8 +128,8 @@ public partial class MainPage : ContentPage
 #if WINDOWS
             if (Window is not null)
             {
-                Window.Width = 800;
-                Window.Height = 450;
+                Window.Width = 720;
+                Window.Height = 700;
             }
 #endif
         };
@@ -231,6 +257,64 @@ public partial class MainPage : ContentPage
 #endif
     }
 
+    private async void OnWindowsFpsChanged(object sender, EventArgs e)
+    {
+#if WINDOWS
+        if (_updatingStreamSelectors) return;
+        var requestedFps = WindowsFpsPicker.SelectedIndex == 0 ? 30 : 60;
+        _receiver.RequestedFrameRate = (byte)requestedFps;
+        _receiver.PrioritizeResolution = false;
+        Preferences.Default.Set("requested_fps", requestedFps);
+        await RestartReceiverForModeChangeAsync($"{requestedFps} FPS");
+#endif
+    }
+
+    private async void OnWindowsResolutionChanged(object sender, EventArgs e)
+    {
+#if WINDOWS
+        if (_updatingStreamSelectors) return;
+        var requestedHeight = WindowsResolutionPicker.SelectedIndex switch
+        {
+            0 => 720,
+            2 => 1440,
+            3 => 2160,
+            _ => 1080
+        };
+        SetRequestedResolution(requestedHeight);
+        _receiver.PrioritizeResolution = true;
+        Preferences.Default.Set("requested_height", requestedHeight);
+        await RestartReceiverForModeChangeAsync(
+            requestedHeight switch
+            {
+                1440 => "2K",
+                2160 => "4K",
+                _ => $"{requestedHeight}p"
+            });
+#endif
+    }
+
+#if WINDOWS
+    private void SetRequestedResolution(int height)
+    {
+        (_receiver.RequestedWidth, _receiver.RequestedHeight) = height switch
+        {
+            720 => ((ushort)1280, (ushort)720),
+            1440 => ((ushort)2560, (ushort)1440),
+            2160 => ((ushort)3840, (ushort)2160),
+            _ => ((ushort)1920, (ushort)1080)
+        };
+    }
+
+    private async Task RestartReceiverForModeChangeAsync(string mode)
+    {
+        if (!_receiverStarted) return;
+        WindowsStatusLabel.Text = $"Switching to {mode}…";
+        await _receiver.StopAsync();
+        _receiverStarted = false;
+        await StartReceiverAsync();
+    }
+#endif
+
 #if WINDOWS
     private async Task StartReceiverAsync()
     {
@@ -239,6 +323,7 @@ public partial class MainPage : ContentPage
         try
         {
             await _receiver.StartAsync(bindAddress, port);
+            _adbReverseManager.Start(port);
             _receiverStarted = true;
             ReceiverAddressLabel.Text = $"Listening on {bindAddress}:{port}";
         }
@@ -254,6 +339,7 @@ public partial class MainPage : ContentPage
         base.OnDisappearing();
 #if WINDOWS
         await _receiver.StopAsync();
+        await _adbReverseManager.DisposeAsync();
         _receiverStarted = false;
 #endif
     }

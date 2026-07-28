@@ -70,9 +70,64 @@ public static class VideoProtocol
     public const byte Version = 2;
     public const int PacketHeaderSize = 32;
     public const int StreamConfigurationSize = 24;
+    public const int StreamRequestSize = 10;
     public const int MaxPayloadBytes = 8 * 1024 * 1024;
 
     private const uint PacketMagic = 0x42434832; // "BCH2"
+    private const uint StreamRequestMagic = 0x42435231; // "BCR1"
+
+    public static bool TryWriteStreamRequest(
+        Span<byte> destination,
+        byte frameRate,
+        ushort width,
+        ushort height,
+        bool prioritizeResolution)
+    {
+        if (destination.Length < StreamRequestSize ||
+            frameRate is not (30 or 60) ||
+            width is not (1280 or 1920 or 2560 or 3840) ||
+            height is not (720 or 1080 or 1440 or 2160))
+            return false;
+
+        BinaryPrimitives.WriteUInt32BigEndian(destination, StreamRequestMagic);
+        destination[4] = frameRate;
+        BinaryPrimitives.WriteUInt16BigEndian(destination[5..], width);
+        BinaryPrimitives.WriteUInt16BigEndian(destination[7..], height);
+        destination[9] = prioritizeResolution ? (byte)1 : (byte)0;
+        return true;
+    }
+
+    public static bool TryReadStreamRequest(
+        ReadOnlySpan<byte> source,
+        out byte frameRate,
+        out ushort width,
+        out ushort height,
+        out bool prioritizeResolution)
+    {
+        frameRate = 0;
+        width = 0;
+        height = 0;
+        prioritizeResolution = false;
+        if (source.Length < StreamRequestSize ||
+            BinaryPrimitives.ReadUInt32BigEndian(source) != StreamRequestMagic ||
+            source[4] is not (30 or 60) ||
+            source[9] > 1)
+        {
+            return false;
+        }
+
+        frameRate = source[4];
+        width = BinaryPrimitives.ReadUInt16BigEndian(source[5..]);
+        height = BinaryPrimitives.ReadUInt16BigEndian(source[7..]);
+        prioritizeResolution = source[9] == 1;
+        if ((width, height) is not (
+                (1280, 720) or
+                (1920, 1080) or
+                (2560, 1440) or
+                (3840, 2160)))
+            return false;
+        return true;
+    }
 
     public static bool TryWritePacketHeader(Span<byte> destination, in VideoPacketHeader header)
     {
