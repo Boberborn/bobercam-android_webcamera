@@ -153,7 +153,6 @@ public static class H264PreviewRenderer
     private static void PresentFrame(byte[] pixels, int length, int width, int height)
     {
         UpdateFps();
-        SharedFrameWriter.Publish(pixels, length, width, height);
         var replaced = Interlocked.Exchange(ref _latestPixels, pixels);
         if (replaced is not null)
             ArrayPool<byte>.Shared.Return(replaced);

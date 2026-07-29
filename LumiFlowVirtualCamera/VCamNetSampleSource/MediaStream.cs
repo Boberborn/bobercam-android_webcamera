@@ -7,8 +7,8 @@ namespace VCamNetSampleSource
 {
     public class MediaStream : MFAttributes, IMFMediaStream2, IKsControl
     {
-        public const int NUM_IMAGE_COLS = 1280;
-        public const int NUM_IMAGE_ROWS = 960;
+        public const int NUM_IMAGE_COLS = 1920;
+        public const int NUM_IMAGE_ROWS = 1080;
         public const int NUM_ALLOCATOR_SAMPLES = 10;
 
         private readonly object _lock = new();
@@ -18,6 +18,7 @@ namespace VCamNetSampleSource
         private IComObject<IMFVideoSampleAllocatorEx>? _allocator;
         private _MF_STREAM_STATE _state;
         private Guid _format;
+        private long _sampleDuration = 333333;
         private FrameGenerator _generator = new();
 
         public MediaStream(MediaSource source, uint index)
@@ -35,39 +36,13 @@ namespace VCamNetSampleSource
                 Functions.MFCreateEventQueue(out var queue).ThrowOnError();
                 _queue = new ComObject<IMFMediaEventQueue>(queue);
 
-                // set 1 here to force RGB32 only
-                var mediaTypes = new IMFMediaType[2];
-
-                // RGB
-                Functions.MFCreateMediaType(out var rgbType).ThrowOnError();
-                rgbType.SetGUID(MFConstants.MF_MT_MAJOR_TYPE, MFConstants.MFMediaType_Video).ThrowOnError();
-                rgbType.SetGUID(MFConstants.MF_MT_SUBTYPE, MFConstants.MFVideoFormat_RGB32).ThrowOnError();
-                rgbType.SetSize(MFConstants.MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-                rgbType.SetUINT32(MFConstants.MF_MT_DEFAULT_STRIDE, NUM_IMAGE_COLS * 4).ThrowOnError();
-                rgbType.SetUINT32(MFConstants.MF_MT_INTERLACE_MODE, (uint)_MFVideoInterlaceMode.MFVideoInterlace_Progressive).ThrowOnError();
-                rgbType.SetUINT32(MFConstants.MF_MT_ALL_SAMPLES_INDEPENDENT, 1).ThrowOnError();
-                rgbType.SetRatio(MFConstants.MF_MT_FRAME_RATE, 30, 1);
-                var bitrate = NUM_IMAGE_COLS * 4 * NUM_IMAGE_ROWS * 8 * 30;
-                rgbType.SetUINT32(MFConstants.MF_MT_AVG_BITRATE, (uint)bitrate).ThrowOnError();
-                rgbType.SetRatio(MFConstants.MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-                mediaTypes[0] = rgbType;
-
-                // NV12
-                if (mediaTypes.Length > 1)
+                var mediaTypes = new[]
                 {
-                    Functions.MFCreateMediaType(out var nv12Type).ThrowOnError();
-                    nv12Type.SetGUID(MFConstants.MF_MT_MAJOR_TYPE, MFConstants.MFMediaType_Video).ThrowOnError();
-                    nv12Type.SetGUID(MFConstants.MF_MT_SUBTYPE, MFConstants.MFVideoFormat_NV12).ThrowOnError();
-                    nv12Type.SetSize(MFConstants.MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-                    nv12Type.SetUINT32(MFConstants.MF_MT_DEFAULT_STRIDE, NUM_IMAGE_COLS * 3 / 2).ThrowOnError();
-                    nv12Type.SetUINT32(MFConstants.MF_MT_INTERLACE_MODE, (uint)_MFVideoInterlaceMode.MFVideoInterlace_Progressive).ThrowOnError();
-                    nv12Type.SetUINT32(MFConstants.MF_MT_ALL_SAMPLES_INDEPENDENT, 1).ThrowOnError();
-                    nv12Type.SetRatio(MFConstants.MF_MT_FRAME_RATE, 30, 1);
-                    bitrate = NUM_IMAGE_COLS * 3 * NUM_IMAGE_ROWS * 8 * 30 / 2;
-                    nv12Type.SetUINT32(MFConstants.MF_MT_AVG_BITRATE, (uint)bitrate).ThrowOnError();
-                    nv12Type.SetRatio(MFConstants.MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-                    mediaTypes[1] = nv12Type;
-                }
+                    CreateMediaType(MFConstants.MFVideoFormat_RGB32, 30),
+                    CreateMediaType(MFConstants.MFVideoFormat_RGB32, 60),
+                    CreateMediaType(MFConstants.MFVideoFormat_NV12, 30),
+                    CreateMediaType(MFConstants.MFVideoFormat_NV12, 60)
+                };
 
                 Functions.MFCreateStreamDescriptor(index, mediaTypes.Length, mediaTypes, out var descriptor).ThrowOnError();
                 descriptor.GetMediaTypeHandler(out var handler).ThrowOnError();
@@ -79,6 +54,44 @@ namespace VCamNetSampleSource
                 EventProvider.LogError(e.ToString());
                 throw;
             }
+        }
+
+        private static IMFMediaType CreateMediaType(Guid format, uint fps)
+        {
+            Functions.MFCreateMediaType(out var type).ThrowOnError();
+            type.SetGUID(
+                MFConstants.MF_MT_MAJOR_TYPE,
+                MFConstants.MFMediaType_Video).ThrowOnError();
+            type.SetGUID(MFConstants.MF_MT_SUBTYPE, format).ThrowOnError();
+            type.SetSize(
+                MFConstants.MF_MT_FRAME_SIZE,
+                NUM_IMAGE_COLS,
+                NUM_IMAGE_ROWS);
+            var bytesPerPixel = format == MFConstants.MFVideoFormat_RGB32
+                ? 4u
+                : 3u;
+            var stride = format == MFConstants.MFVideoFormat_RGB32
+                ? NUM_IMAGE_COLS * 4u
+                : NUM_IMAGE_COLS * 3u / 2u;
+            type.SetUINT32(
+                MFConstants.MF_MT_DEFAULT_STRIDE,
+                stride).ThrowOnError();
+            type.SetUINT32(
+                MFConstants.MF_MT_INTERLACE_MODE,
+                (uint)_MFVideoInterlaceMode
+                    .MFVideoInterlace_Progressive).ThrowOnError();
+            type.SetUINT32(
+                MFConstants.MF_MT_ALL_SAMPLES_INDEPENDENT,
+                1).ThrowOnError();
+            type.SetRatio(MFConstants.MF_MT_FRAME_RATE, fps, 1);
+            var bitrate = format == MFConstants.MFVideoFormat_RGB32
+                ? (ulong)NUM_IMAGE_COLS * NUM_IMAGE_ROWS * bytesPerPixel * 8 * fps
+                : (ulong)NUM_IMAGE_COLS * NUM_IMAGE_ROWS * bytesPerPixel * 8 * fps / 2;
+            type.SetUINT32(
+                MFConstants.MF_MT_AVG_BITRATE,
+                checked((uint)bitrate)).ThrowOnError();
+            type.SetRatio(MFConstants.MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            return type;
         }
 
         public HRESULT Start(IMFMediaType? type)
@@ -96,6 +109,16 @@ namespace VCamNetSampleSource
                 allocator.Object.InitializeSampleAllocator(NUM_ALLOCATOR_SAMPLES, type).ThrowOnError();
 
                 type.GetGUID(MFConstants.MF_MT_SUBTYPE, out _format).ThrowOnError();
+                type.GetUINT64(
+                    MFConstants.MF_MT_FRAME_RATE,
+                    out var packedFrameRate).ThrowOnError();
+                var numerator = (uint)(packedFrameRate >> 32);
+                var denominator = (uint)packedFrameRate;
+                if (numerator == 0 || denominator == 0)
+                    return HRESULTS.E_INVALIDARG;
+                _sampleDuration = checked(
+                    (long)Math.Round(
+                        10_000_000d * denominator / numerator));
                 EventProvider.LogInfo("Format: " + _format.GetMFName());
             }
 
@@ -333,7 +356,7 @@ namespace VCamNetSampleSource
                     using (var inputSample = new ComObject<IMFSample>(sample))
                     {
                         sample.SetSampleTime(Functions.MFGetSystemTime()).ThrowOnError();
-                        sample.SetSampleDuration(333333).ThrowOnError();
+                        sample.SetSampleDuration(_sampleDuration).ThrowOnError();
 
                         using var outputSample = _generator.Generate(inputSample, _format);
                         if (token != null)

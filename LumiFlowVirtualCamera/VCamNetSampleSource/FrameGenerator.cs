@@ -1,7 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO;
-using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using DirectN;
 using VCamNetSampleSource.Utilities;
@@ -31,17 +29,7 @@ namespace VCamNetSampleSource
 
         public bool HasD3DManager => _texture != null;
         public ulong FrameCount => _frameCount;
-        private const int SharedFrameHeaderSize = 64;
-        private const int SharedFrameMaxBytes = 1920 * 1920 * 4;
-        private const int SharedFrameMappingSize =
-            SharedFrameHeaderSize + SharedFrameMaxBytes;
-        private static readonly string SharedFrameFilePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            "BobrCam",
-            "Frames",
-            "live.bgra");
-        private MemoryMappedFile? _sharedFrameMap;
-        private MemoryMappedViewAccessor? _sharedFrameView;
+        private readonly SharedH264FrameReader _sharedH264Frames = new();
         private IComObject<ID2D1Bitmap>? _lastPhoneFrame;
         private int _lastPhoneFrameWidth;
         private int _lastPhoneFrameHeight;
@@ -53,74 +41,31 @@ namespace VCamNetSampleSource
 
             try
             {
-                if (_sharedFrameMap == null)
-                {
-                    using var file = new FileStream(
-                        SharedFrameFilePath,
-                        FileMode.Open,
-                        FileAccess.Read,
-                        FileShare.ReadWrite | FileShare.Delete);
-                    _sharedFrameMap = MemoryMappedFile.CreateFromFile(
-                        file,
-                        null,
-                        SharedFrameMappingSize,
-                        MemoryMappedFileAccess.Read,
-                        HandleInheritability.None,
-                        leaveOpen: false);
-                }
-                _sharedFrameView ??= _sharedFrameMap.CreateViewAccessor(
-                    0,
-                    SharedFrameMappingSize,
-                    MemoryMappedFileAccess.Read);
-
-                var view = _sharedFrameView;
-                if (view.ReadUInt32(0) != 0x42434631u || view.ReadInt32(4) != 1)
-                    return DrawLastPhoneFrame();
-                var sequence = view.ReadInt64(8);
-                if ((sequence & 1) != 0)
-                    return DrawLastPhoneFrame();
-                var sourceWidth = view.ReadInt32(16);
-                var sourceHeight = view.ReadInt32(20);
-                var stride = view.ReadInt32(24);
-                var length = view.ReadInt32(28);
-                if (sourceWidth <= 0 || sourceHeight <= 0 ||
-                    stride != sourceWidth * 4 ||
-                    length != sourceHeight * stride ||
-                    length > SharedFrameMaxBytes)
+                if (!_sharedH264Frames.TryGetLatestFrame(
+                        out var pixels,
+                        out var sourceWidth,
+                        out var sourceHeight))
                     return DrawLastPhoneFrame();
 
-                byte* pointer = null;
                 ID2D1Bitmap bitmap;
-                try
+                var properties = new D2D1_BITMAP_PROPERTIES
                 {
-                    view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
-                    var properties = new D2D1_BITMAP_PROPERTIES
+                    dpiX = 96,
+                    dpiY = 96,
+                    pixelFormat = new D2D1_PIXEL_FORMAT
                     {
-                        dpiX = 96,
-                        dpiY = 96,
-                        pixelFormat = new D2D1_PIXEL_FORMAT
-                        {
-                            format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
-                            alphaMode = D2D1_ALPHA_MODE.D2D1_ALPHA_MODE_IGNORE
-                        }
-                    };
+                        format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode = D2D1_ALPHA_MODE.D2D1_ALPHA_MODE_IGNORE
+                    }
+                };
+                fixed (byte* pointer = pixels)
+                {
                     _renderTarget.Object.CreateBitmap(
                         new D2D_SIZE_U((uint)sourceWidth, (uint)sourceHeight),
-                        (IntPtr)(pointer + view.PointerOffset + SharedFrameHeaderSize),
-                        (uint)stride,
+                        (IntPtr)pointer,
+                        (uint)(sourceWidth * 4),
                         ref properties,
                         out bitmap).ThrowOnError();
-                }
-                finally
-                {
-                    if (pointer is not null)
-                        view.SafeMemoryMappedViewHandle.ReleasePointer();
-                }
-
-                if (view.ReadInt64(8) != sequence)
-                {
-                    Marshal.ReleaseComObject(bitmap);
-                    return DrawLastPhoneFrame();
                 }
                 var previousFrame = _lastPhoneFrame;
                 _lastPhoneFrame = new ComObject<ID2D1Bitmap>(bitmap);
@@ -459,8 +404,7 @@ namespace VCamNetSampleSource
                         _lastPhoneFrame.SafeDispose();
                         _renderTarget.SafeDispose();
                         _converter.SafeDispose();
-                        _sharedFrameView?.Dispose();
-                        _sharedFrameMap?.Dispose();
+                        _sharedH264Frames.Dispose();
                     }
 
                     // free unmanaged resources (unmanaged objects) and override finalizer

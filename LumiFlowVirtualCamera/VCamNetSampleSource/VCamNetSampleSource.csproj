@@ -16,6 +16,13 @@
 
 	<ItemGroup>
 	  <PackageReference Include="DirectNCore" Version="1.16.1.2" />
+	  <PackageReference Include="FFmpeg.AutoGen" Version="8.1.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <None Include="..\..\BobrCam\libs\*.dll"
+	        Link="libs\%(Filename)%(Extension)"
+	        CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 </Project>

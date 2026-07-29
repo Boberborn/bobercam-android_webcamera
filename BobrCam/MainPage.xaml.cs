@@ -60,6 +60,7 @@ public partial class MainPage : ContentPage
         _receiver.StreamConfigured += (configuration, codecData) =>
         {
 #if WINDOWS
+            SharedH264StreamWriter.Configure(configuration, codecData);
             H264PreviewRenderer.Configure(configuration, codecData);
             MainThread.BeginInvokeOnMainThread(() =>
             {
@@ -86,6 +87,7 @@ public partial class MainPage : ContentPage
         _receiver.AccessUnitReceived += accessUnit =>
         {
 #if WINDOWS
+            SharedH264StreamWriter.Publish(accessUnit);
             H264PreviewRenderer.Submit(accessUnit);
 #endif
         };

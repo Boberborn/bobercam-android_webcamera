@@ -16,8 +16,16 @@ $requiredFiles = @(
     (Join-Path $sourceOutput 'BobrCam.VirtualCameraSource.deps.json'),
     (Join-Path $sourceOutput 'BobrCam.VirtualCameraSource.runtimeconfig.json'),
     (Join-Path $sourceOutput 'DirectNCore.dll'),
+    (Join-Path $sourceOutput 'FFmpeg.AutoGen.dll'),
     (Join-Path $sourceOutput 'Microsoft.Windows.SDK.NET.dll'),
     (Join-Path $sourceOutput 'WinRT.Runtime.dll'),
+    (Join-Path $sourceOutput 'libs\avcodec-62.dll'),
+    (Join-Path $sourceOutput 'libs\avutil-60.dll'),
+    (Join-Path $sourceOutput 'libs\swscale-9.dll'),
+    (Join-Path $sourceOutput 'libs\swresample-6.dll'),
+    (Join-Path $sourceOutput 'libs\avformat-62.dll'),
+    (Join-Path $sourceOutput 'libs\avdevice-62.dll'),
+    (Join-Path $sourceOutput 'libs\avfilter-11.dll'),
     (Join-Path $registrarOutput 'BobrCam.VirtualCamera.exe'),
     (Join-Path $registrarOutput 'BobrCam.VirtualCamera.dll'),
     (Join-Path $registrarOutput 'BobrCam.VirtualCamera.deps.json'),
@@ -32,7 +40,15 @@ foreach ($file in $requiredFiles) {
 
 New-Item -ItemType Directory -Force -Path $installDirectory, $framesDirectory | Out-Null
 foreach ($file in $requiredFiles) {
-    Copy-Item -LiteralPath $file -Destination $installDirectory -Force
+    if ($file.StartsWith($sourceOutput, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $relativePath = $file.Substring($sourceOutput.Length).TrimStart('\')
+    }
+    else {
+        $relativePath = [System.IO.Path]::GetFileName($file)
+    }
+    $destination = Join-Path $installDirectory $relativePath
+    New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($destination)) | Out-Null
+    Copy-Item -LiteralPath $file -Destination $destination -Force
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Uninstall-BobrCamVirtualCamera.ps1') `
     -Destination $installDirectory -Force
