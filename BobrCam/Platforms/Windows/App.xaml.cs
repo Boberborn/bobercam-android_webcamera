@@ -10,12 +10,26 @@ namespace BobrCam.WinUI;
 /// </summary>
 public partial class App : MauiWinUIApplication
 {
+	private const string SingleInstanceMutexName =
+		@"Local\BobrCam.Windows.SingleInstance.4CB32243";
+	private readonly Mutex? _singleInstanceMutex;
+
 	/// <summary>
 	/// Initializes the singleton application object.  This is the first line of authored code
 	/// executed, and as such is the logical equivalent of main() or WinMain().
 	/// </summary>
 	public App()
 	{
+		_singleInstanceMutex = new Mutex(
+			initiallyOwned: true,
+			SingleInstanceMutexName,
+			out var isFirstInstance);
+		if (!isFirstInstance)
+		{
+			Environment.Exit(0);
+			return;
+		}
+
 		this.InitializeComponent();
 	}
 

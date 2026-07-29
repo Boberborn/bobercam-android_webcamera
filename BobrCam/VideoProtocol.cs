@@ -9,13 +9,62 @@ public enum VideoPacketType : byte
 {
     StreamConfiguration = 1,
     AccessUnit = 2,
-    EndOfStream = 3
+    EndOfStream = 3,
+    CameraCapabilities = 4
 }
 
 public enum CameraControlCommand : byte
 {
     SwitchCamera = 1,
-    ToggleFlash = 2
+    ToggleFlash = 2,
+    SetExposureCompensation = 3,
+    SetZoom = 4,
+    SetWhiteBalance = 5,
+    SetEffectMode = 10,
+    SetBeautySmoothness = 11,
+    SetBeautyBrightness = 12,
+    SetBeautyWarmth = 13,
+    SetBeautyVignette = 14,
+    SetMaskStrength = 15
+}
+
+public enum VideoEffectMode : byte
+{
+    Off = 0,
+    Beauty = 1,
+    Mask = 2
+}
+
+public enum CameraWhiteBalanceMode : byte
+{
+    Auto = 1,
+    Incandescent = 2,
+    Fluorescent = 3,
+    Daylight = 5,
+    CloudyDaylight = 6
+}
+
+[Flags]
+public enum CameraCapabilityFlags : byte
+{
+    None = 0,
+    Flash = 1 << 0,
+    ExposureCompensation = 1 << 1,
+    Zoom = 1 << 2,
+    WhiteBalance = 1 << 3,
+    PhoneGpuEffects = 1 << 4,
+    FaceTracking = 1 << 5
+}
+
+[Flags]
+public enum CameraWhiteBalanceModes : ushort
+{
+    None = 0,
+    Auto = 1 << 0,
+    Incandescent = 1 << 1,
+    Fluorescent = 1 << 2,
+    Daylight = 1 << 3,
+    CloudyDaylight = 1 << 4
 }
 
 [Flags]
@@ -61,6 +110,20 @@ public readonly record struct H264StreamConfiguration(
     ushort RotationDegrees,
     byte MaxBFrames);
 
+public readonly record struct CameraControlMessage(
+    CameraControlCommand Command,
+    int Value);
+
+public readonly record struct CameraCapabilities(
+    CameraCapabilityFlags Flags,
+    sbyte MinimumExposureCompensation,
+    sbyte MaximumExposureCompensation,
+    ushort MaximumZoomHundredths,
+    CameraWhiteBalanceModes WhiteBalanceModes,
+    sbyte CurrentExposureCompensation,
+    ushort CurrentZoomHundredths,
+    CameraWhiteBalanceMode CurrentWhiteBalanceMode);
+
 public sealed record EncodedVideoAccessUnit(
     byte[] Data,
     uint Sequence,
@@ -81,13 +144,15 @@ public static class VideoProtocol
     public const int PacketHeaderSize = 32;
     public const int StreamConfigurationSize = 24;
     public const int StreamRequestSize = 11;
-    public const int CameraControlSize = 8;
+    public const int CameraControlSize = 12;
+    public const int CameraCapabilitiesSize = 16;
     public const int MaxPayloadBytes = 8 * 1024 * 1024;
     public const int MaxCodecConfigurationBytes = 256 * 1024;
 
     private const uint PacketMagic = 0x42434832; // "BCH2"
     private const uint StreamRequestMagic = 0x42435231; // "BCR1"
-    private const uint CameraControlMagic = 0x42434331; // "BCC1"
+    private const uint CameraControlMagic = 0x42434332; // "BCC2"
+    private const byte CameraControlVersion = 1;
     private const uint AuthenticationChallengeMagic = 0x42434E31; // "BCN1"
     private const uint AuthenticationResponseMagic = 0x42434132; // "BCA2"
 
@@ -216,31 +281,108 @@ public static class VideoProtocol
 
     public static bool TryWriteCameraControl(
         Span<byte> destination,
-        CameraControlCommand command)
+        in CameraControlMessage message)
     {
         if (destination.Length < CameraControlSize ||
-            command is not (CameraControlCommand.SwitchCamera or
-                CameraControlCommand.ToggleFlash))
+            !IsValidCameraControl(message))
             return false;
         destination[..CameraControlSize].Clear();
         BinaryPrimitives.WriteUInt32BigEndian(destination, CameraControlMagic);
-        destination[4] = (byte)command;
+        destination[4] = CameraControlVersion;
+        destination[5] = (byte)message.Command;
+        BinaryPrimitives.WriteInt32BigEndian(destination[8..], message.Value);
         return true;
     }
 
     public static bool TryReadCameraControl(
         ReadOnlySpan<byte> source,
-        out CameraControlCommand command)
+        out CameraControlMessage message)
     {
-        command = default;
+        message = default;
         if (source.Length < CameraControlSize ||
-            BinaryPrimitives.ReadUInt32BigEndian(source) != CameraControlMagic)
+            BinaryPrimitives.ReadUInt32BigEndian(source) != CameraControlMagic ||
+            source[4] != CameraControlVersion)
             return false;
-        var candidate = (CameraControlCommand)source[4];
-        if (candidate is not (CameraControlCommand.SwitchCamera or
-            CameraControlCommand.ToggleFlash))
+        var command = (CameraControlCommand)source[5];
+        var candidate = new CameraControlMessage(
+            command,
+            BinaryPrimitives.ReadInt32BigEndian(source[8..]));
+        if (!IsValidCameraControl(candidate))
             return false;
-        command = candidate;
+        message = candidate;
+        return true;
+    }
+
+    public static bool TryWriteCameraCapabilities(
+        Span<byte> destination,
+        in CameraCapabilities capabilities)
+    {
+        if (destination.Length < CameraCapabilitiesSize ||
+            capabilities.MinimumExposureCompensation >
+                capabilities.MaximumExposureCompensation ||
+            capabilities.MaximumZoomHundredths < 100 ||
+            capabilities.CurrentExposureCompensation <
+                capabilities.MinimumExposureCompensation ||
+            capabilities.CurrentExposureCompensation >
+                capabilities.MaximumExposureCompensation ||
+            capabilities.CurrentZoomHundredths is < 100 ||
+            capabilities.CurrentZoomHundredths >
+                capabilities.MaximumZoomHundredths)
+        {
+            return false;
+        }
+
+        destination[..CameraCapabilitiesSize].Clear();
+        destination[0] = 1;
+        destination[1] = (byte)capabilities.Flags;
+        destination[2] = unchecked((byte)capabilities.MinimumExposureCompensation);
+        destination[3] = unchecked((byte)capabilities.MaximumExposureCompensation);
+        BinaryPrimitives.WriteUInt16BigEndian(
+            destination[4..],
+            capabilities.MaximumZoomHundredths);
+        BinaryPrimitives.WriteUInt16BigEndian(
+            destination[6..],
+            (ushort)capabilities.WhiteBalanceModes);
+        destination[8] = unchecked((byte)capabilities.CurrentExposureCompensation);
+        destination[9] = (byte)capabilities.CurrentWhiteBalanceMode;
+        BinaryPrimitives.WriteUInt16BigEndian(
+            destination[10..],
+            capabilities.CurrentZoomHundredths);
+        return true;
+    }
+
+    public static bool TryReadCameraCapabilities(
+        ReadOnlySpan<byte> source,
+        out CameraCapabilities capabilities)
+    {
+        capabilities = default;
+        if (source.Length != CameraCapabilitiesSize || source[0] != 1)
+            return false;
+
+        var candidate = new CameraCapabilities(
+            (CameraCapabilityFlags)source[1],
+            unchecked((sbyte)source[2]),
+            unchecked((sbyte)source[3]),
+            BinaryPrimitives.ReadUInt16BigEndian(source[4..]),
+            (CameraWhiteBalanceModes)BinaryPrimitives.ReadUInt16BigEndian(source[6..]),
+            unchecked((sbyte)source[8]),
+            BinaryPrimitives.ReadUInt16BigEndian(source[10..]),
+            (CameraWhiteBalanceMode)source[9]);
+        if (candidate.MinimumExposureCompensation >
+                candidate.MaximumExposureCompensation ||
+            candidate.MaximumZoomHundredths < 100 ||
+            candidate.CurrentExposureCompensation <
+                candidate.MinimumExposureCompensation ||
+            candidate.CurrentExposureCompensation >
+                candidate.MaximumExposureCompensation ||
+            candidate.CurrentZoomHundredths is < 100 ||
+            candidate.CurrentZoomHundredths >
+                candidate.MaximumZoomHundredths)
+        {
+            return false;
+        }
+
+        capabilities = candidate;
         return true;
     }
 
@@ -356,7 +498,8 @@ public static class VideoProtocol
     private static bool IsKnownPacketType(VideoPacketType type) =>
         type is VideoPacketType.StreamConfiguration or
             VideoPacketType.AccessUnit or
-            VideoPacketType.EndOfStream;
+            VideoPacketType.EndOfStream or
+            VideoPacketType.CameraCapabilities;
 
     private static bool IsValidPacketLength(VideoPacketType type, int payloadLength) =>
         type switch
@@ -365,6 +508,30 @@ public static class VideoProtocol
                 payloadLength is >= StreamConfigurationSize and <= MaxCodecConfigurationBytes,
             VideoPacketType.AccessUnit => payloadLength is > 0 and <= MaxPayloadBytes,
             VideoPacketType.EndOfStream => payloadLength == 0,
+            VideoPacketType.CameraCapabilities => payloadLength == CameraCapabilitiesSize,
+            _ => false
+        };
+
+    private static bool IsValidCameraControl(in CameraControlMessage message) =>
+        message.Command switch
+        {
+            CameraControlCommand.SwitchCamera or
+                CameraControlCommand.ToggleFlash => message.Value == 0,
+            CameraControlCommand.SetExposureCompensation =>
+                message.Value is >= sbyte.MinValue and <= sbyte.MaxValue,
+            CameraControlCommand.SetZoom =>
+                message.Value is >= 100 and <= ushort.MaxValue,
+            CameraControlCommand.SetWhiteBalance =>
+                Enum.IsDefined((CameraWhiteBalanceMode)message.Value),
+            CameraControlCommand.SetEffectMode =>
+                Enum.IsDefined((VideoEffectMode)message.Value),
+            CameraControlCommand.SetBeautySmoothness or
+                CameraControlCommand.SetBeautyVignette or
+                CameraControlCommand.SetMaskStrength =>
+                    message.Value is >= 0 and <= 100,
+            CameraControlCommand.SetBeautyBrightness or
+                CameraControlCommand.SetBeautyWarmth =>
+                    message.Value is >= -50 and <= 50,
             _ => false
         };
 

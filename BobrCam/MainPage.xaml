@@ -10,7 +10,12 @@
             <RowDefinition x:Name="PreviewRow" Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <Border Grid.Row="0" Stroke="#F45145" StrokeThickness="2" StrokeShape="RoundRectangle 16" BackgroundColor="Black">
+        <Border x:Name="PreviewBorder"
+                Grid.Row="0"
+                Stroke="#F45145"
+                StrokeThickness="2"
+                StrokeShape="RoundRectangle 16"
+                BackgroundColor="Black">
             <Grid>
                 <Image x:Name="PreviewImage" Aspect="AspectFill" BackgroundColor="Black" />
                 <local:CameraPreview x:Name="CameraPreview" BackgroundColor="Black" />
@@ -69,21 +74,149 @@
                 <Button Grid.Column="2" Text="▣ Camera" FontSize="12"
                         HeightRequest="32" MinimumHeightRequest="32" Padding="6,2"
                         Clicked="OnSwitchCameraClicked" />
-                <Button Grid.Column="3" Text="ϟ Flash" FontSize="12"
+                <Button x:Name="FlashButton" Grid.Column="3" Text="ϟ Flash" FontSize="12"
                         HeightRequest="32" MinimumHeightRequest="32" Padding="6,2"
                         Clicked="OnFlashClicked" />
             </Grid>
-            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
-                <Label x:Name="PairedPhonesLabel"
-                       VerticalTextAlignment="Center"
-                       Text="0 paired phones" />
-                <Button Grid.Column="1"
-                        Text="Allow new phone (60s)"
-                        Clicked="OnAllowNewPhoneClicked" />
-                <Button Grid.Column="2"
-                        Text="Forget phones"
-                        Clicked="OnForgetPhonesClicked" />
+            <Grid x:Name="CameraSettingsGrid"
+                  IsVisible="False"
+                  ColumnDefinitions="*,*,*"
+                  ColumnSpacing="14"
+                  HorizontalOptions="Fill">
+                <VerticalStackLayout Spacing="0">
+                    <Label x:Name="ExposureValueLabel"
+                           Text="Exposure 0"
+                           FontSize="12" />
+                    <Slider x:Name="ExposureSlider"
+                            Minimum="-3"
+                            Maximum="3"
+                            Value="0"
+                            ValueChanged="OnExposureChanged" />
+                </VerticalStackLayout>
+                <VerticalStackLayout Grid.Column="1" Spacing="0">
+                    <Label x:Name="ZoomValueLabel"
+                           Text="Zoom 1.0×"
+                           FontSize="12" />
+                    <Slider x:Name="ZoomSlider"
+                            Minimum="1"
+                            Maximum="1"
+                            Value="1"
+                            ValueChanged="OnZoomChanged" />
+                </VerticalStackLayout>
+                <VerticalStackLayout Grid.Column="2" Spacing="0">
+                    <Label Text="White balance" FontSize="12" />
+                    <Picker x:Name="WhiteBalancePicker"
+                            HeightRequest="36"
+                            SelectedIndexChanged="OnWhiteBalanceChanged" />
+                </VerticalStackLayout>
             </Grid>
+            <Border x:Name="EffectsCard"
+                    IsEnabled="False"
+                    Stroke="#6D4C41"
+                    StrokeThickness="1"
+                    StrokeShape="RoundRectangle 12"
+                    BackgroundColor="{AppThemeBinding Light=#FFF0E3, Dark=#302321}"
+                    Padding="10,8">
+                <VerticalStackLayout Spacing="7">
+                    <Grid ColumnDefinitions="Auto,*,*,*" ColumnSpacing="6">
+                        <Label Text="Effects"
+                               VerticalTextAlignment="Center"
+                               FontAttributes="Bold"
+                               Margin="0,0,6,0" />
+                        <Button x:Name="EffectOffButton"
+                                Grid.Column="1"
+                                Text="Off"
+                                FontSize="12"
+                                HeightRequest="32"
+                                MinimumHeightRequest="32"
+                                Padding="8,2"
+                                Clicked="OnEffectOffClicked" />
+                        <Button x:Name="BeautyModeButton"
+                                Grid.Column="2"
+                                Text="✦ Beauty"
+                                FontSize="12"
+                                HeightRequest="32"
+                                MinimumHeightRequest="32"
+                                Padding="8,2"
+                                Clicked="OnBeautyModeClicked" />
+                        <Button x:Name="MaskModeButton"
+                                Grid.Column="3"
+                                Text="● Bobr Mask"
+                                FontSize="12"
+                                HeightRequest="32"
+                                MinimumHeightRequest="32"
+                                Padding="8,2"
+                                Clicked="OnMaskModeClicked" />
+                    </Grid>
+
+                    <Grid x:Name="BeautySettingsGrid"
+                          IsVisible="False"
+                          ColumnDefinitions="*,*,*,*"
+                          ColumnSpacing="8">
+                        <VerticalStackLayout Spacing="0">
+                            <Label x:Name="BeautySmoothLabel"
+                                   Text="Smooth 35"
+                                   FontSize="11" />
+                            <Slider x:Name="BeautySmoothSlider"
+                                    Minimum="0"
+                                    Maximum="100"
+                                    Value="35"
+                                    ValueChanged="OnBeautySmoothChanged" />
+                        </VerticalStackLayout>
+                        <VerticalStackLayout Grid.Column="1" Spacing="0">
+                            <Label x:Name="BeautyBrightnessLabel"
+                                   Text="Light 0"
+                                   FontSize="11" />
+                            <Slider x:Name="BeautyBrightnessSlider"
+                                    Minimum="-50"
+                                    Maximum="50"
+                                    Value="0"
+                                    ValueChanged="OnBeautyBrightnessChanged" />
+                        </VerticalStackLayout>
+                        <VerticalStackLayout Grid.Column="2" Spacing="0">
+                            <Label x:Name="BeautyWarmthLabel"
+                                   Text="Warmth 0"
+                                   FontSize="11" />
+                            <Slider x:Name="BeautyWarmthSlider"
+                                    Minimum="-50"
+                                    Maximum="50"
+                                    Value="0"
+                                    ValueChanged="OnBeautyWarmthChanged" />
+                        </VerticalStackLayout>
+                        <VerticalStackLayout Grid.Column="3" Spacing="0">
+                            <Label x:Name="BeautyVignetteLabel"
+                                   Text="Vignette 0"
+                                   FontSize="11" />
+                            <Slider x:Name="BeautyVignetteSlider"
+                                    Minimum="0"
+                                    Maximum="100"
+                                    Value="0"
+                                    ValueChanged="OnBeautyVignetteChanged" />
+                        </VerticalStackLayout>
+                    </Grid>
+
+                    <Grid x:Name="MaskSettingsGrid"
+                          IsVisible="False"
+                          ColumnDefinitions="Auto,*,Auto"
+                          ColumnSpacing="10">
+                        <Label x:Name="MaskTrackingLabel"
+                               Text="Face-tracked Bobr"
+                               FontSize="12"
+                               VerticalTextAlignment="Center" />
+                        <Slider x:Name="MaskStrengthSlider"
+                                Grid.Column="1"
+                                Minimum="0"
+                                Maximum="100"
+                                Value="90"
+                                ValueChanged="OnMaskStrengthChanged" />
+                        <Label x:Name="MaskStrengthLabel"
+                               Grid.Column="2"
+                               Text="90%"
+                               FontSize="12"
+                               VerticalTextAlignment="Center" />
+                    </Grid>
+                </VerticalStackLayout>
+            </Border>
         </VerticalStackLayout>
 
     </Grid>

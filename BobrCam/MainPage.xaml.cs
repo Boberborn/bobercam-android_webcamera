@@ -11,6 +11,19 @@ public partial class MainPage : ContentPage
 #if WINDOWS
     private bool _previewMirrored;
     private int _previewRotation;
+    private int _previewAspectWidth = 16;
+    private int _previewAspectHeight = 9;
+    private bool _updatingCameraControls;
+    private bool _updatingEffectControls;
+    private bool _effectControlsSupported;
+    private bool _faceTrackingSupported;
+    private ushort? _resolutionBeforeLegacyEffect;
+    private byte? _frameRateBeforeLegacyEffect;
+    private VideoEffectMode _selectedEffectMode;
+    private CameraWhiteBalanceMode[] _availableWhiteBalanceModes =
+        [CameraWhiteBalanceMode.Auto];
+    private readonly Dictionary<CameraControlCommand, CancellationTokenSource>
+        _cameraControlDebounce = [];
 #endif
 #if ANDROID
     private bool _androidAutoConnectStarted;
@@ -23,9 +36,43 @@ public partial class MainPage : ContentPage
         AndroidPanel.IsVisible = false;
         WindowsPanel.IsVisible = true;
         WindowsFpsLabel.IsVisible = true;
-        PreviewRow.Height = new GridLength(270);
+        PreviewRow.Height = GridLength.Auto;
+        PreviewBorder.WidthRequest = 640;
+        PreviewBorder.MaximumWidthRequest = 720;
+        PreviewBorder.HorizontalOptions = LayoutOptions.Center;
+        PreviewBorder.VerticalOptions = LayoutOptions.Start;
+        PreviewBorder.SizeChanged += (_, _) => UpdateWindowsPreviewSize();
         WindowsFpsPicker.ItemsSource = new[] { "30 FPS", "60 FPS" };
         WindowsResolutionPicker.ItemsSource = new[] { "720p", "1080p", "2K", "4K" };
+        WhiteBalancePicker.ItemsSource = new[] { "Auto" };
+        WhiteBalancePicker.SelectedIndex = 0;
+        _updatingEffectControls = true;
+        _selectedEffectMode = Enum.IsDefined(
+            (VideoEffectMode)Preferences.Default.Get("effect_mode", 0))
+            ? (VideoEffectMode)Preferences.Default.Get("effect_mode", 0)
+            : VideoEffectMode.Off;
+        BeautySmoothSlider.Value = Math.Clamp(
+            Preferences.Default.Get("beauty_smoothness", 35),
+            0,
+            100);
+        BeautyBrightnessSlider.Value = Math.Clamp(
+            Preferences.Default.Get("beauty_brightness", 0),
+            -50,
+            50);
+        BeautyWarmthSlider.Value = Math.Clamp(
+            Preferences.Default.Get("beauty_warmth", 0),
+            -50,
+            50);
+        BeautyVignetteSlider.Value = Math.Clamp(
+            Preferences.Default.Get("beauty_vignette", 0),
+            0,
+            100);
+        MaskStrengthSlider.Value = Math.Clamp(
+            Preferences.Default.Get("mask_strength", 90),
+            0,
+            100);
+        _updatingEffectControls = false;
+        ApplyEffectModeUi();
         var requestedFps = Preferences.Default.Get("requested_fps", 60);
         var requestedHeight = Preferences.Default.Get("requested_height", 1080);
         _updatingStreamSelectors = true;
@@ -45,10 +92,16 @@ public partial class MainPage : ContentPage
         H264PreviewRenderer.FpsChanged += fps =>
             MainThread.BeginInvokeOnMainThread(() =>
                 WindowsFpsLabel.Text = $"{fps:0.0} FPS");
+        _receiver.CameraCapabilitiesReceived += capabilities =>
+            MainThread.BeginInvokeOnMainThread(() =>
+                ApplyCameraCapabilities(capabilities));
 #else
         AndroidPanel.IsVisible = true;
         WindowsPanel.IsVisible = false;
         WindowsFpsLabel.IsVisible = false;
+        PreviewBorder.IsVisible = false;
+        PreviewRow.Height = new GridLength(0);
+        CameraPreview.IsVisible = false;
         AndroidCameraStreamer.ConnectionStatusChanged += status =>
             MainThread.BeginInvokeOnMainThread(() =>
             {
@@ -76,10 +129,24 @@ public partial class MainPage : ContentPage
                     >= 1440 => 2,
                     _ => 1
                 };
+                _previewAspectWidth = configuration.Width;
+                _previewAspectHeight = configuration.Height;
+                UpdateWindowsPreviewSize();
+                H264PreviewRenderer.SetPreviewTransform(
+                    _previewMirrored,
+                    _previewRotation);
+                SharedH264StreamWriter.SetRotation(_previewRotation);
                 _receiver.RequestedFrameRate = (byte)(actualFps >= 60 ? 60 : 30);
                 SetRequestedResolution(configuration.Height);
-                Preferences.Default.Set("requested_fps", (int)_receiver.RequestedFrameRate);
-                Preferences.Default.Set("requested_height", (int)_receiver.RequestedHeight);
+                if (_resolutionBeforeLegacyEffect is null)
+                {
+                    Preferences.Default.Set(
+                        "requested_fps",
+                        (int)_receiver.RequestedFrameRate);
+                    Preferences.Default.Set(
+                        "requested_height",
+                        (int)_receiver.RequestedHeight);
+                }
                 _updatingStreamSelectors = false;
             });
 #endif
@@ -94,46 +161,9 @@ public partial class MainPage : ContentPage
         _receiver.StatusChanged += status => MainThread.BeginInvokeOnMainThread(() =>
         {
             WindowsStatusLabel.Text = status;
-#if WINDOWS
-            UpdatePairedPhonesLabel();
-#endif
         });
 #if ANDROID
         PreviewImage.IsVisible = false;
-        CameraPreview.SurfaceReady += async () =>
-        {
-            if (await Permissions.RequestAsync<Permissions.Camera>() == PermissionStatus.Granted)
-                await AndroidCameraStreamer.StartLocalPreviewAsync();
-        };
-        SizeChanged += (_, _) =>
-        {
-            MainThread.BeginInvokeOnMainThread(() =>
-            {
-                if (CameraPreview.Handler?.PlatformView is AspectRatioTextureView tv)
-                {
-                    var ctx = tv.Context;
-                    if (ctx is Android.Content.Context c)
-                    {
-                        var wm = c.GetSystemService(Android.Content.Context.WindowService)
-                            as Android.Views.IWindowManager;
-                        if (wm is not null)
-                        {
-                            var rot = wm.DefaultDisplay?.Rotation ?? Android.Views.SurfaceOrientation.Rotation0;
-                            int degrees = rot switch
-                            {
-                                Android.Views.SurfaceOrientation.Rotation90 => 90,
-                                Android.Views.SurfaceOrientation.Rotation180 => 180,
-                                Android.Views.SurfaceOrientation.Rotation270 => 270,
-                                _ => 0
-                            };
-                            AndroidCameraStreamer.ApplyDisplayOrientation(degrees);
-                            AndroidCameraStreamer.GetRotatedAspect(out var w, out var h);
-                            tv.SetTargetAspect(w, h);
-                        }
-                    }
-                }
-            });
-        };
 #endif
         Loaded += (_, _) =>
         {
@@ -141,16 +171,13 @@ public partial class MainPage : ContentPage
             if (Window is not null)
             {
                 Window.Width = 720;
-                Window.Height = 640;
+                Window.Height = 850;
             }
 #endif
         };
         WindowsIpEntry.Text = NetworkAddress.GetLocalIPv4Address();
         WindowsPortEntry.Text = VideoProtocol.Port.ToString();
         AndroidPortEntry.Text = VideoProtocol.Port.ToString();
-#if WINDOWS
-        UpdatePairedPhonesLabel();
-#endif
     }
 
     protected override async void OnAppearing()
@@ -164,7 +191,6 @@ public partial class MainPage : ContentPage
 #elif ANDROID
         if (await Permissions.RequestAsync<Permissions.Camera>() == PermissionStatus.Granted)
         {
-            await AndroidCameraStreamer.StartLocalPreviewAsync();
             if (!_androidAutoConnectStarted)
             {
                 _androidAutoConnectStarted = true;
@@ -254,8 +280,6 @@ public partial class MainPage : ContentPage
         {
             AndroidStatusLabel.Text = ex.GetBaseException().Message;
             UsbButton.IsEnabled = WifiButton.IsEnabled = true;
-            try { await AndroidCameraStreamer.StartLocalPreviewAsync(); }
-            catch { }
         }
     }
 #endif
@@ -280,28 +304,6 @@ public partial class MainPage : ContentPage
 #endif
     }
 
-    private void OnAllowNewPhoneClicked(object sender, EventArgs e)
-    {
-#if WINDOWS
-        _receiver.AllowNewPhone(TimeSpan.FromSeconds(60));
-#endif
-    }
-
-    private async void OnForgetPhonesClicked(object sender, EventArgs e)
-    {
-#if WINDOWS
-        var confirmed = await DisplayAlert(
-            "Forget paired phones?",
-            "Every phone must be paired again. A phone connected by USB can pair automatically.",
-            "Forget",
-            "Cancel");
-        if (!confirmed)
-            return;
-        _receiver.ForgetPairedPhones();
-        UpdatePairedPhonesLabel();
-#endif
-    }
-
     private void OnFlipClicked(object sender, EventArgs e)
     {
 #if WINDOWS
@@ -319,6 +321,7 @@ public partial class MainPage : ContentPage
         H264PreviewRenderer.SetPreviewTransform(
             _previewMirrored,
             _previewRotation);
+        SharedH264StreamWriter.SetRotation(_previewRotation);
 #endif
     }
 
@@ -340,19 +343,444 @@ public partial class MainPage : ContentPage
     }
 
 #if WINDOWS
-    private async Task SendCameraControlAsync(
-        CameraControlCommand command,
-        string status)
+    private void ApplyCameraCapabilities(CameraCapabilities capabilities)
     {
+        _updatingCameraControls = true;
         try
         {
-            WindowsStatusLabel.Text = status;
-            await _receiver.SendCameraControlAsync(command);
+            var exposureAvailable = capabilities.Flags.HasFlag(
+                CameraCapabilityFlags.ExposureCompensation);
+            ExposureSlider.IsEnabled = exposureAvailable;
+            ExposureSlider.Minimum = capabilities.MinimumExposureCompensation;
+            ExposureSlider.Maximum = capabilities.MaximumExposureCompensation;
+            ExposureSlider.Value = capabilities.CurrentExposureCompensation;
+            ExposureValueLabel.Text =
+                $"Exposure {capabilities.CurrentExposureCompensation:+0;-0;0}";
+
+            var zoomAvailable = capabilities.Flags.HasFlag(
+                CameraCapabilityFlags.Zoom);
+            ZoomSlider.IsEnabled = zoomAvailable;
+            ZoomSlider.Minimum = 1;
+            ZoomSlider.Maximum = Math.Max(
+                1,
+                capabilities.MaximumZoomHundredths / 100d);
+            ZoomSlider.Value = Math.Clamp(
+                capabilities.CurrentZoomHundredths / 100d,
+                ZoomSlider.Minimum,
+                ZoomSlider.Maximum);
+            ZoomValueLabel.Text = $"Zoom {ZoomSlider.Value:0.0}×";
+
+            var modes = new List<(string Label, CameraWhiteBalanceMode Mode)>();
+            AddWhiteBalanceMode(
+                CameraWhiteBalanceModes.Auto,
+                "Auto",
+                CameraWhiteBalanceMode.Auto);
+            AddWhiteBalanceMode(
+                CameraWhiteBalanceModes.Daylight,
+                "Daylight",
+                CameraWhiteBalanceMode.Daylight);
+            AddWhiteBalanceMode(
+                CameraWhiteBalanceModes.CloudyDaylight,
+                "Cloudy",
+                CameraWhiteBalanceMode.CloudyDaylight);
+            AddWhiteBalanceMode(
+                CameraWhiteBalanceModes.Fluorescent,
+                "Fluorescent",
+                CameraWhiteBalanceMode.Fluorescent);
+            AddWhiteBalanceMode(
+                CameraWhiteBalanceModes.Incandescent,
+                "Incandescent",
+                CameraWhiteBalanceMode.Incandescent);
+            if (modes.Count == 0)
+                modes.Add(("Auto", CameraWhiteBalanceMode.Auto));
+
+            _availableWhiteBalanceModes =
+                modes.Select(item => item.Mode).ToArray();
+            WhiteBalancePicker.ItemsSource =
+                modes.Select(item => item.Label).ToArray();
+            WhiteBalancePicker.SelectedIndex = Math.Max(
+                0,
+                Array.IndexOf(
+                    _availableWhiteBalanceModes,
+                    capabilities.CurrentWhiteBalanceMode));
+            WhiteBalancePicker.IsEnabled =
+                capabilities.Flags.HasFlag(CameraCapabilityFlags.WhiteBalance);
+            FlashButton.IsEnabled =
+                capabilities.Flags.HasFlag(CameraCapabilityFlags.Flash);
+            CameraSettingsGrid.IsVisible =
+                exposureAvailable ||
+                zoomAvailable ||
+                WhiteBalancePicker.IsEnabled;
+            _effectControlsSupported = capabilities.Flags.HasFlag(
+                CameraCapabilityFlags.PhoneGpuEffects);
+            _faceTrackingSupported = capabilities.Flags.HasFlag(
+                CameraCapabilityFlags.FaceTracking);
+            EffectsCard.IsEnabled = _effectControlsSupported;
+            MaskModeButton.IsEnabled =
+                _effectControlsSupported && _faceTrackingSupported;
+            MaskTrackingLabel.Text = _faceTrackingSupported
+                ? "Face-tracked Bobr"
+                : "Requires phone face tracking";
+            if (!_faceTrackingSupported &&
+                _selectedEffectMode == VideoEffectMode.Mask)
+            {
+                _selectedEffectMode = VideoEffectMode.Off;
+                Preferences.Default.Set(
+                    "effect_mode",
+                    (int)VideoEffectMode.Off);
+            }
+            ApplyEffectModeUi();
+            _ = !_faceTrackingSupported &&
+                _selectedEffectMode == VideoEffectMode.Beauty &&
+                _receiver.RequestedHeight > 720
+                ? SelectEffectModeAsync(VideoEffectMode.Beauty)
+                : RestorePhoneEffectSettingsAsync();
+
+            void AddWhiteBalanceMode(
+                CameraWhiteBalanceModes flag,
+                string label,
+                CameraWhiteBalanceMode mode)
+            {
+                if (capabilities.WhiteBalanceModes.HasFlag(flag))
+                    modes.Add((label, mode));
+            }
+        }
+        finally
+        {
+            _updatingCameraControls = false;
+        }
+    }
+
+    private void OnExposureChanged(object sender, ValueChangedEventArgs e)
+    {
+        var value = (int)Math.Round(e.NewValue);
+        ExposureValueLabel.Text = $"Exposure {value:+0;-0;0}";
+        if (!_updatingCameraControls)
+            QueueCameraControl(
+                CameraControlCommand.SetExposureCompensation,
+                value);
+    }
+
+    private void OnZoomChanged(object sender, ValueChangedEventArgs e)
+    {
+        ZoomValueLabel.Text = $"Zoom {e.NewValue:0.0}×";
+        if (!_updatingCameraControls)
+            QueueCameraControl(
+                CameraControlCommand.SetZoom,
+                (int)Math.Round(e.NewValue * 100));
+    }
+
+    private async void OnWhiteBalanceChanged(object sender, EventArgs e)
+    {
+        if (_updatingCameraControls ||
+            WhiteBalancePicker.SelectedIndex < 0 ||
+            WhiteBalancePicker.SelectedIndex >= _availableWhiteBalanceModes.Length)
+        {
+            return;
+        }
+
+        await SendCameraControlAsync(
+            CameraControlCommand.SetWhiteBalance,
+            "Applying phone white balance…",
+            (int)_availableWhiteBalanceModes[WhiteBalancePicker.SelectedIndex]);
+    }
+
+    private async void OnEffectOffClicked(object sender, EventArgs e) =>
+        await SelectEffectModeAsync(VideoEffectMode.Off);
+
+    private async void OnBeautyModeClicked(object sender, EventArgs e) =>
+        await SelectEffectModeAsync(VideoEffectMode.Beauty);
+
+    private async void OnMaskModeClicked(object sender, EventArgs e)
+    {
+        await SelectEffectModeAsync(VideoEffectMode.Mask);
+    }
+
+    private async Task SelectEffectModeAsync(VideoEffectMode mode)
+    {
+        if (!_effectControlsSupported)
+        {
+            WindowsStatusLabel.Text =
+                "Connect a phone that supports GPU effects first.";
+            return;
+        }
+
+        if (mode == VideoEffectMode.Mask && !_faceTrackingSupported)
+        {
+            WindowsStatusLabel.Text =
+                "Bobr Mask requires a phone with face tracking.";
+            return;
+        }
+
+        _selectedEffectMode = mode;
+        Preferences.Default.Set("effect_mode", (int)mode);
+        ApplyEffectModeUi();
+
+        if (!_faceTrackingSupported &&
+            mode == VideoEffectMode.Beauty &&
+            _receiver.RequestedHeight > 720)
+        {
+            _resolutionBeforeLegacyEffect ??= _receiver.RequestedHeight;
+            _frameRateBeforeLegacyEffect ??= _receiver.RequestedFrameRate;
+            SetRequestedResolution(720);
+            _receiver.RequestedFrameRate = 30;
+            _receiver.PrioritizeResolution = true;
+            _updatingStreamSelectors = true;
+            WindowsResolutionPicker.SelectedIndex = 0;
+            WindowsFpsPicker.SelectedIndex = 0;
+            _updatingStreamSelectors = false;
+            await RestartReceiverForModeChangeAsync(
+                "720p30 Beauty for this phone");
+            return;
+        }
+
+        if (mode == VideoEffectMode.Off &&
+            _resolutionBeforeLegacyEffect is ushort previousHeight &&
+            _frameRateBeforeLegacyEffect is byte previousFrameRate)
+        {
+            SetRequestedResolution(previousHeight);
+            _receiver.RequestedFrameRate = previousFrameRate;
+            _receiver.PrioritizeResolution = true;
+            _updatingStreamSelectors = true;
+            WindowsResolutionPicker.SelectedIndex = previousHeight switch
+            {
+                <= 720 => 0,
+                >= 2160 => 3,
+                >= 1440 => 2,
+                _ => 1
+            };
+            WindowsFpsPicker.SelectedIndex = previousFrameRate >= 60 ? 1 : 0;
+            _updatingStreamSelectors = false;
+            _resolutionBeforeLegacyEffect = null;
+            _frameRateBeforeLegacyEffect = null;
+            await RestartReceiverForModeChangeAsync(
+                $"{previousHeight}p direct H.264");
+            return;
+        }
+
+        await SendCameraControlAsync(
+            CameraControlCommand.SetEffectMode,
+            mode switch
+            {
+                VideoEffectMode.Beauty => "Starting phone Beauty mode…",
+                VideoEffectMode.Mask when _faceTrackingSupported =>
+                    "Starting face-tracked Bobr mask…",
+                _ => "Returning to direct H.264 mode…"
+            },
+            (int)mode);
+    }
+
+    private void ApplyEffectModeUi()
+    {
+        BeautySettingsGrid.IsVisible =
+            _selectedEffectMode == VideoEffectMode.Beauty;
+        MaskSettingsGrid.IsVisible =
+            _selectedEffectMode == VideoEffectMode.Mask;
+        SetModeButtonState(
+            EffectOffButton,
+            _selectedEffectMode == VideoEffectMode.Off);
+        SetModeButtonState(
+            BeautyModeButton,
+            _selectedEffectMode == VideoEffectMode.Beauty);
+        SetModeButtonState(
+            MaskModeButton,
+            _selectedEffectMode == VideoEffectMode.Mask);
+
+        static void SetModeButtonState(Button button, bool selected)
+        {
+            button.BackgroundColor = Color.FromArgb(
+                selected ? "#F45145" : "#59413B");
+            button.TextColor = Colors.White;
+        }
+    }
+
+    private async Task RestorePhoneEffectSettingsAsync()
+    {
+        if (!_effectControlsSupported)
+            return;
+        try
+        {
+            await _receiver.SendCameraControlAsync(
+                CameraControlCommand.SetBeautySmoothness,
+                (int)Math.Round(BeautySmoothSlider.Value));
+            await _receiver.SendCameraControlAsync(
+                CameraControlCommand.SetBeautyBrightness,
+                (int)Math.Round(BeautyBrightnessSlider.Value));
+            await _receiver.SendCameraControlAsync(
+                CameraControlCommand.SetBeautyWarmth,
+                (int)Math.Round(BeautyWarmthSlider.Value));
+            await _receiver.SendCameraControlAsync(
+                CameraControlCommand.SetBeautyVignette,
+                (int)Math.Round(BeautyVignetteSlider.Value));
+            await _receiver.SendCameraControlAsync(
+                CameraControlCommand.SetMaskStrength,
+                (int)Math.Round(MaskStrengthSlider.Value));
+            await _receiver.SendCameraControlAsync(
+                CameraControlCommand.SetEffectMode,
+                (int)_selectedEffectMode);
         }
         catch (Exception ex)
         {
             WindowsStatusLabel.Text = ex.GetBaseException().Message;
         }
+    }
+
+    private void OnBeautySmoothChanged(object sender, ValueChangedEventArgs e)
+    {
+        var value = (int)Math.Round(e.NewValue);
+        BeautySmoothLabel.Text = $"Smooth {value}";
+        if (_updatingEffectControls)
+            return;
+        Preferences.Default.Set("beauty_smoothness", value);
+        QueueCameraControl(CameraControlCommand.SetBeautySmoothness, value);
+    }
+
+    private void OnBeautyBrightnessChanged(
+        object sender,
+        ValueChangedEventArgs e)
+    {
+        var value = (int)Math.Round(e.NewValue);
+        BeautyBrightnessLabel.Text = $"Light {value:+0;-0;0}";
+        if (_updatingEffectControls)
+            return;
+        Preferences.Default.Set("beauty_brightness", value);
+        QueueCameraControl(CameraControlCommand.SetBeautyBrightness, value);
+    }
+
+    private void OnBeautyWarmthChanged(object sender, ValueChangedEventArgs e)
+    {
+        var value = (int)Math.Round(e.NewValue);
+        BeautyWarmthLabel.Text = $"Warmth {value:+0;-0;0}";
+        if (_updatingEffectControls)
+            return;
+        Preferences.Default.Set("beauty_warmth", value);
+        QueueCameraControl(CameraControlCommand.SetBeautyWarmth, value);
+    }
+
+    private void OnBeautyVignetteChanged(
+        object sender,
+        ValueChangedEventArgs e)
+    {
+        var value = (int)Math.Round(e.NewValue);
+        BeautyVignetteLabel.Text = $"Vignette {value}";
+        if (_updatingEffectControls)
+            return;
+        Preferences.Default.Set("beauty_vignette", value);
+        QueueCameraControl(CameraControlCommand.SetBeautyVignette, value);
+    }
+
+    private void OnMaskStrengthChanged(object sender, ValueChangedEventArgs e)
+    {
+        var value = (int)Math.Round(e.NewValue);
+        MaskStrengthLabel.Text = $"{value}%";
+        if (_updatingEffectControls)
+            return;
+        Preferences.Default.Set("mask_strength", value);
+        QueueCameraControl(CameraControlCommand.SetMaskStrength, value);
+    }
+
+    private void QueueCameraControl(CameraControlCommand command, int value)
+    {
+        if (_cameraControlDebounce.TryGetValue(command, out var previous))
+            previous.Cancel();
+        var cancellation = new CancellationTokenSource();
+        _cameraControlDebounce[command] = cancellation;
+        _ = SendDebouncedCameraControlAsync(command, value, cancellation);
+    }
+
+    private async Task SendDebouncedCameraControlAsync(
+        CameraControlCommand command,
+        int value,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            await Task.Delay(120, cancellation.Token);
+            await _receiver.SendCameraControlAsync(
+                command,
+                value,
+                cancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            WindowsStatusLabel.Text = ex.GetBaseException().Message;
+        }
+        finally
+        {
+            if (_cameraControlDebounce.TryGetValue(command, out var current) &&
+                ReferenceEquals(current, cancellation))
+            {
+                _cameraControlDebounce.Remove(command);
+            }
+            cancellation.Dispose();
+        }
+    }
+
+    private async Task SendCameraControlAsync(
+        CameraControlCommand command,
+        string status,
+        int value = 0)
+    {
+        try
+        {
+            WindowsStatusLabel.Text = status;
+            await _receiver.SendCameraControlAsync(command, value);
+        }
+        catch (Exception ex)
+        {
+            WindowsStatusLabel.Text = ex.GetBaseException().Message;
+        }
+    }
+#else
+    private void OnExposureChanged(object sender, ValueChangedEventArgs e)
+    {
+    }
+
+    private void OnZoomChanged(object sender, ValueChangedEventArgs e)
+    {
+    }
+
+    private void OnWhiteBalanceChanged(object sender, EventArgs e)
+    {
+    }
+
+    private void OnEffectOffClicked(object sender, EventArgs e)
+    {
+    }
+
+    private void OnBeautyModeClicked(object sender, EventArgs e)
+    {
+    }
+
+    private void OnMaskModeClicked(object sender, EventArgs e)
+    {
+    }
+
+    private void OnBeautySmoothChanged(object sender, ValueChangedEventArgs e)
+    {
+    }
+
+    private void OnBeautyBrightnessChanged(
+        object sender,
+        ValueChangedEventArgs e)
+    {
+    }
+
+    private void OnBeautyWarmthChanged(object sender, ValueChangedEventArgs e)
+    {
+    }
+
+    private void OnBeautyVignetteChanged(
+        object sender,
+        ValueChangedEventArgs e)
+    {
+    }
+
+    private void OnMaskStrengthChanged(object sender, ValueChangedEventArgs e)
+    {
     }
 #endif
 
@@ -404,6 +832,21 @@ public partial class MainPage : ContentPage
         };
     }
 
+    private void UpdateWindowsPreviewSize()
+    {
+        if (PreviewBorder.Width <= 0 ||
+            _previewAspectWidth <= 0 ||
+            _previewAspectHeight <= 0)
+        {
+            return;
+        }
+
+        var desiredHeight =
+            PreviewBorder.Width * _previewAspectHeight / _previewAspectWidth;
+        if (Math.Abs(PreviewBorder.HeightRequest - desiredHeight) > 0.5)
+            PreviewBorder.HeightRequest = desiredHeight;
+    }
+
     private async Task RestartReceiverForModeChangeAsync(string mode)
     {
         if (!_receiverStarted) return;
@@ -426,7 +869,6 @@ public partial class MainPage : ContentPage
             _receiverStarted = true;
             ReceiverAddressLabel.Text =
                 $"Wi-Fi TLS: {bindAddress}:{port} · USB ADB: 127.0.0.1:{VideoProtocol.UsbHostPort}";
-            UpdatePairedPhonesLabel();
         }
         catch (Exception ex)
         {
@@ -434,9 +876,6 @@ public partial class MainPage : ContentPage
         }
     }
 
-    private void UpdatePairedPhonesLabel() =>
-        PairedPhonesLabel.Text =
-            $"{_receiver.PairedPhoneCount} paired phone(s)";
 #endif
 
     protected override async void OnDisappearing()

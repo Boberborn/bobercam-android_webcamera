@@ -87,16 +87,37 @@ namespace VCamNetSampleSource
                 _lastPhoneFrameWidth <= 0 || _lastPhoneFrameHeight <= 0)
                 return false;
 
+            var rotationDegrees = _sharedH264Frames.RotationDegrees;
+            var quarterTurn = rotationDegrees is 90 or 270;
+            var outputSourceWidth = quarterTurn
+                ? _lastPhoneFrameHeight
+                : _lastPhoneFrameWidth;
+            var outputSourceHeight = quarterTurn
+                ? _lastPhoneFrameWidth
+                : _lastPhoneFrameHeight;
             var scale = Math.Min(
-                _width / (float)_lastPhoneFrameWidth,
-                _height / (float)_lastPhoneFrameHeight);
+                _width / (float)outputSourceWidth,
+                _height / (float)outputSourceHeight);
             var width = _lastPhoneFrameWidth * scale;
             var height = _lastPhoneFrameHeight * scale;
             var left = (_width - width) / 2f;
             var top = (_height - height) / 2f;
-            _renderTarget.DrawBitmap(frame, 1f,
-                D2D1_BITMAP_INTERPOLATION_MODE.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                new D2D_RECT_F(left, top, left + width, top + height), null);
+            var transform = D2D_MATRIX_3X2_F.Rotation(
+                rotationDegrees,
+                _width / 2f,
+                _height / 2f);
+            _renderTarget.Object.SetTransform(ref transform);
+            try
+            {
+                _renderTarget.DrawBitmap(frame, 1f,
+                    D2D1_BITMAP_INTERPOLATION_MODE.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    new D2D_RECT_F(left, top, left + width, top + height), null);
+            }
+            finally
+            {
+                var identity = D2D_MATRIX_3X2_F.Identity();
+                _renderTarget.Object.SetTransform(ref identity);
+            }
             return true;
         }
 

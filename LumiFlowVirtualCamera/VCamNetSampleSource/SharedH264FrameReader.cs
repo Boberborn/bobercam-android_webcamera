@@ -32,6 +32,7 @@ namespace VCamNetSampleSource
         private long _nextSequence;
         private bool _waitingForKeyFrame = true;
         private string? _lastError;
+        public int RotationDegrees { get; private set; }
 
         public bool TryGetLatestFrame(
             out byte[] pixels,
@@ -53,6 +54,10 @@ namespace VCamNetSampleSource
                 var generation = view.ReadInt64(8);
                 if (generation <= 0 || (generation & 1) != 0)
                     return TryGetDecodedFrame(out pixels, out width, out height);
+                var rotationDegrees = view.ReadInt32(44);
+                RotationDegrees = rotationDegrees is 90 or 180 or 270
+                    ? rotationDegrees
+                    : 0;
 
                 if (generation != _generation)
                     ConfigureDecoder(view, generation);
@@ -120,6 +125,7 @@ namespace VCamNetSampleSource
                 generation,
                 latestSequence);
             _waitingForKeyFrame = true;
+            RotationDegrees = 0;
         }
 
         private void PumpAccessUnits(

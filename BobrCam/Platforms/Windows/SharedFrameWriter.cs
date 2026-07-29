@@ -25,6 +25,7 @@ internal static unsafe class SharedH264StreamWriter
     private static MemoryMappedViewAccessor? _view;
     private static long _generation;
     private static long _sequence;
+    private static int _rotationDegrees;
 
     public static void Configure(
         in H264StreamConfiguration configuration,
@@ -52,6 +53,7 @@ internal static unsafe class SharedH264StreamWriter
             view.Write(32, (int)configuration.FrameRateNumerator);
             view.Write(36, (int)configuration.FrameRateDenominator);
             view.Write(40, codecData.Length);
+            view.Write(44, _rotationDegrees);
             view.Write(48, DateTime.UtcNow.Ticks);
             if (codecData.Length > 0)
                 view.WriteArray(64, codecData, 0, codecData.Length);
@@ -59,6 +61,16 @@ internal static unsafe class SharedH264StreamWriter
             view.Write(8, completeGeneration);
             _generation = completeGeneration;
             _sequence = 0;
+        }
+    }
+
+    public static void SetRotation(int rotationDegrees)
+    {
+        lock (Sync)
+        {
+            _rotationDegrees =
+                ((rotationDegrees % 360) + 360) % 360;
+            _view?.Write(44, _rotationDegrees);
         }
     }
 

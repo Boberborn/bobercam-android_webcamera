@@ -21,7 +21,7 @@ public sealed class CameraPreviewHandler
     {
         var image = new Microsoft.UI.Xaml.Controls.Image
         {
-            Stretch = Microsoft.UI.Xaml.Media.Stretch.UniformToFill,
+            Stretch = Microsoft.UI.Xaml.Media.Stretch.Uniform,
             HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Center,
             VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Center
         };
@@ -47,6 +47,8 @@ public static class H264PreviewRenderer
     private static int _latestWidth;
     private static int _latestHeight;
     private static int _presentScheduled;
+    private static bool _mirrored;
+    private static int _rotationDegrees;
     private static long _fpsWindowStart = System.Diagnostics.Stopwatch.GetTimestamp();
     private static int _fpsWindowFrames;
 
@@ -56,6 +58,7 @@ public static class H264PreviewRenderer
         {
             _image = image;
             _dispatcher = image.DispatcherQueue;
+            image.SizeChanged += (_, _) => ApplyPreviewTransform();
         }
     }
 
@@ -92,19 +95,34 @@ public static class H264PreviewRenderer
 
     public static void SetPreviewTransform(bool mirrored, int rotationDegrees)
     {
+        _mirrored = mirrored;
+        _rotationDegrees =
+            ((rotationDegrees % 360) + 360) % 360;
         var dispatcher = _dispatcher;
         if (dispatcher is null) return;
-        dispatcher.TryEnqueue(() =>
+        dispatcher.TryEnqueue(ApplyPreviewTransform);
+    }
+
+    private static void ApplyPreviewTransform()
+    {
+        if (_image is null) return;
+        var quarterTurn = _rotationDegrees is 90 or 270;
+        var fitScale = 1d;
+        if (quarterTurn &&
+            _image.ActualWidth > 0 &&
+            _image.ActualHeight > 0)
         {
-            if (_image is null) return;
-            _image.RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5);
-            _image.RenderTransform = new Microsoft.UI.Xaml.Media.CompositeTransform
-            {
-                ScaleX = mirrored ? -1 : 1,
-                ScaleY = 1,
-                Rotation = rotationDegrees
-            };
-        });
+            fitScale = Math.Min(
+                _image.ActualWidth / _image.ActualHeight,
+                _image.ActualHeight / _image.ActualWidth);
+        }
+        _image.RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5);
+        _image.RenderTransform = new Microsoft.UI.Xaml.Media.CompositeTransform
+        {
+            ScaleX = (_mirrored ? -1 : 1) * fitScale,
+            ScaleY = fitScale,
+            Rotation = _rotationDegrees
+        };
     }
 
     private static async Task DecodeLoopAsync(

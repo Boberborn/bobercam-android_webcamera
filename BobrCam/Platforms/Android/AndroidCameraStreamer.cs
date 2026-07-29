@@ -39,10 +39,14 @@ public static class AndroidCameraStreamer
 
     private static CameraDevice? _camera;
     private static CameraCaptureSession? _captureSession;
+    private static SessionStateCallback? _captureSessionCallback;
+    private static TaskCompletionSource? _captureSessionClosed;
+    private static CaptureRequest.Builder? _repeatingRequestBuilder;
     private static HandlerThread? _cameraThread;
     private static Handler? _cameraHandler;
     private static MediaCodec? _encoder;
     private static Surface? _encoderSurface;
+    private static AndroidGpuVideoRenderer? _gpuRenderer;
     private static Surface? _previewOutput;
     private static SurfaceTexture? _previewTexture;
     private static TcpClient? _client;
@@ -53,7 +57,6 @@ public static class AndroidCameraStreamer
     private static Task? _drainTask;
     private static Task? _controlTask;
     private static bool _wantPreview;
-    private static int _displayOrientation;
     private static int _streamFps = FallbackFps;
     private static int _requestedFps = PreferredFps;
     private static int _requestedWidth = FullHdWidth;
@@ -66,6 +69,17 @@ public static class AndroidCameraStreamer
     private static CameraCharacteristics? _cameraCharacteristics;
     private static bool _useFrontCamera;
     private static bool _flashEnabled;
+    private static int _exposureCompensation;
+    private static int _zoomHundredths = 100;
+    private static CameraWhiteBalanceMode _whiteBalanceMode =
+        CameraWhiteBalanceMode.Auto;
+    private static VideoEffectMode _effectMode;
+    private static int _beautySmoothness = 35;
+    private static int _beautyBrightness;
+    private static int _beautyWarmth;
+    private static int _beautyVignette;
+    private static int _maskStrength = 90;
+    private static readonly FaceCaptureCallback FaceCapture = new();
     private static uint _sequence;
 
     public static volatile string? LastError;
@@ -85,26 +99,9 @@ public static class AndroidCameraStreamer
         surface.SetDefaultBufferSize(FullHdWidth, FullHdHeight);
         _previewOutput?.Dispose();
         _previewOutput = new Surface(surface);
-        onReady?.Invoke(_displayOrientation, FullHdWidth, FullHdHeight);
+        onReady?.Invoke(0, FullHdWidth, FullHdHeight);
         if (_wantPreview)
             _ = ReconfigureCameraAsync();
-    }
-
-    public static void ApplyDisplayOrientation(int degrees) =>
-        _displayOrientation = (degrees + 90) % 360;
-
-    public static void GetRotatedAspect(out int width, out int height)
-    {
-        if (_displayOrientation is 90 or 270)
-        {
-            width = FullHdHeight;
-            height = FullHdWidth;
-        }
-        else
-        {
-            width = FullHdWidth;
-            height = FullHdHeight;
-        }
     }
 
     public static async Task StartLocalPreviewAsync()
@@ -400,8 +397,9 @@ public static class AndroidCameraStreamer
             ConfigureStreamMode();
             StartEncoder();
             await CreateCaptureSessionAsync(streaming: true);
-            _drainTask = Task.Run(() => DrainEncoderAsync(cancellation.Token));
             _controlTask = Task.Run(() => ReadControlsAsync(cancellation.Token));
+            await SendCameraCapabilitiesAsync(cancellation.Token);
+            _drainTask = Task.Run(() => DrainEncoderAsync(cancellation.Token));
         }
         finally
         {
@@ -424,6 +422,8 @@ public static class AndroidCameraStreamer
             _captureSession?.Close();
             _captureSession?.Dispose();
             _captureSession = null;
+            _repeatingRequestBuilder?.Dispose();
+            _repeatingRequestBuilder = null;
             StopEncoder();
             _outputStream?.Dispose();
             _outputStream = null;
@@ -656,6 +656,8 @@ public static class AndroidCameraStreamer
 
     private static void StopEncoder()
     {
+        _gpuRenderer?.Dispose();
+        _gpuRenderer = null;
         try { _encoder?.SignalEndOfInputStream(); } catch { }
         try { _encoder?.Stop(); } catch { }
         _encoderSurface?.Dispose();
@@ -666,32 +668,304 @@ public static class AndroidCameraStreamer
 
     private static async Task CreateCaptureSessionAsync(bool streaming)
     {
-        if (_camera is null || _previewOutput is null) return;
+        if (_camera is null) return;
+        _repeatingRequestBuilder?.Dispose();
+        _repeatingRequestBuilder = null;
         _captureSession?.Close();
         _captureSession?.Dispose();
         _captureSession = null;
 
-        var outputs = new List<Surface> { _previewOutput };
+        var outputs = new List<Surface>();
+        if (_wantPreview && _previewOutput is not null)
+            outputs.Add(_previewOutput);
         if (streaming && _encoderSurface is not null)
-            outputs.Add(_encoderSurface);
+        {
+            if (_effectMode != VideoEffectMode.Off)
+            {
+                try
+                {
+                    EnsureGpuRenderer();
+                    outputs.Add(_gpuRenderer!.InputSurface);
+                }
+                catch (Exception ex)
+                {
+                    Android.Util.Log.Error(
+                        "BobrCam",
+                        $"Phone GPU compositor unavailable: {ex}");
+                    _effectMode = VideoEffectMode.Off;
+                    _gpuRenderer?.Dispose();
+                    _gpuRenderer = null;
+                    ConnectionStatusChanged?.Invoke(
+                        $"Phone GPU effects unavailable: {ex.GetBaseException().Message}");
+                    outputs.Add(_encoderSurface);
+                }
+            }
+            else
+            {
+                outputs.Add(_encoderSurface);
+            }
+        }
+        if (outputs.Count == 0)
+            return;
 
         var completion = new TaskCompletionSource<CameraCaptureSession>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        _camera.CreateCaptureSession(outputs, new SessionStateCallback(completion), _cameraHandler);
+        _captureSessionClosed = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        _captureSessionCallback = new SessionStateCallback(
+            completion,
+            _captureSessionClosed);
+        _camera.CreateCaptureSession(
+            outputs,
+            _captureSessionCallback,
+            _cameraHandler);
         _captureSession = await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
-        using var request = _camera.CreateCaptureRequest(
+        var request = _camera.CreateCaptureRequest(
             streaming ? CameraTemplate.Record : CameraTemplate.Preview);
+        _repeatingRequestBuilder = request;
         foreach (var output in outputs)
             request.AddTarget(output);
-        request.Set(CaptureRequest.ControlMode, new Java.Lang.Integer((int)ControlMode.Auto));
-        if (_flashEnabled)
-            request.Set(
-                CaptureRequest.FlashMode,
-                new Java.Lang.Integer((int)Android.Hardware.Camera2.FlashMode.Torch));
+        ApplyCameraSettings(request);
+        _captureSession.SetRepeatingRequest(
+            request.Build(),
+            FaceCapture,
+            _cameraHandler);
+    }
+
+    private static void EnsureGpuRenderer()
+    {
+        if (_gpuRenderer is not null)
+        {
+            UpdateGpuEffectSettings();
+            return;
+        }
+        var encoderSurface = _encoderSurface ??
+            throw new InvalidOperationException("H.264 encoder surface is unavailable.");
+        _gpuRenderer = new AndroidGpuVideoRenderer(
+            encoderSurface,
+            _streamWidth,
+            _streamHeight);
+        Android.Util.Log.Info(
+            "BobrCam",
+            $"Phone GPU compositor ready at {_streamWidth}x{_streamHeight}.");
+        UpdateGpuEffectSettings();
+    }
+
+    private static void UpdateGpuEffectSettings()
+    {
+        _gpuRenderer?.SetSettings(
+            _effectMode,
+            _beautySmoothness,
+            _beautyBrightness,
+            _beautyWarmth,
+            _beautyVignette,
+            _maskStrength);
+        if (_gpuRenderer is null)
+            return;
+        if (_effectMode != VideoEffectMode.Mask ||
+            GetBestFaceDetectionMode() == 0)
+        {
+            _gpuRenderer.ClearFace();
+        }
+    }
+
+    private static void ApplyCameraSettings(CaptureRequest.Builder request)
+    {
+        request.Set(
+            CaptureRequest.ControlMode,
+            new Java.Lang.Integer((int)ControlMode.Auto));
+        request.Set(
+            CaptureRequest.FlashMode,
+            new Java.Lang.Integer((int)(_flashEnabled
+                ? Android.Hardware.Camera2.FlashMode.Torch
+                : Android.Hardware.Camera2.FlashMode.Off)));
         if (_targetFpsRange is not null)
             request.Set(CaptureRequest.ControlAeTargetFpsRange, _targetFpsRange);
-        _captureSession.SetRepeatingRequest(request.Build(), null, _cameraHandler);
+
+        var exposureRange = GetExposureCompensationRange();
+        if (exposureRange is not null)
+        {
+            _exposureCompensation = Math.Clamp(
+                _exposureCompensation,
+                Convert.ToInt32(exposureRange.Lower),
+                Convert.ToInt32(exposureRange.Upper));
+            request.Set(
+                CaptureRequest.ControlAeExposureCompensation,
+                new Java.Lang.Integer(_exposureCompensation));
+        }
+
+        var supportedWhiteBalance = GetSupportedWhiteBalanceModes();
+        if (!IsWhiteBalanceSupported(supportedWhiteBalance, _whiteBalanceMode))
+            _whiteBalanceMode = CameraWhiteBalanceMode.Auto;
+        request.Set(
+            CaptureRequest.ControlAwbMode,
+            new Java.Lang.Integer((int)_whiteBalanceMode));
+        var faceDetectionMode = _effectMode == VideoEffectMode.Mask
+            ? GetBestFaceDetectionMode()
+            : 0;
+        request.Set(
+            CaptureRequest.StatisticsFaceDetectMode,
+            new Java.Lang.Integer(faceDetectionMode));
+
+        var maximumZoom = GetMaximumZoom();
+        _zoomHundredths = Math.Clamp(
+            _zoomHundredths,
+            100,
+            (int)Math.Round(maximumZoom * 100));
+        var cropRegion = GetCurrentCropRegion();
+        if (cropRegion is not null)
+            request.Set(CaptureRequest.ScalerCropRegion, cropRegion);
+    }
+
+    private static async Task ApplyCameraControlAsync(
+        CameraControlMessage message,
+        CancellationToken token)
+    {
+        await StateGate.WaitAsync(token);
+        try
+        {
+            var rebuildEffectPipeline = false;
+            var cameraRequestChanged = false;
+            var effectModeChanged = false;
+            switch (message.Command)
+            {
+                case CameraControlCommand.SetExposureCompensation:
+                    _exposureCompensation = message.Value;
+                    cameraRequestChanged = true;
+                    break;
+                case CameraControlCommand.SetZoom:
+                    _zoomHundredths = message.Value;
+                    cameraRequestChanged = true;
+                    break;
+                case CameraControlCommand.SetWhiteBalance:
+                    _whiteBalanceMode = (CameraWhiteBalanceMode)message.Value;
+                    cameraRequestChanged = true;
+                    break;
+                case CameraControlCommand.SetEffectMode:
+                    var nextMode = (VideoEffectMode)message.Value;
+                    effectModeChanged = nextMode != _effectMode;
+                    rebuildEffectPipeline =
+                        (_effectMode == VideoEffectMode.Off) !=
+                        (nextMode == VideoEffectMode.Off);
+                    _effectMode = nextMode;
+                    if (effectModeChanged)
+                        Android.Util.Log.Info("BobrCam", $"GPU effect mode: {_effectMode}");
+                    break;
+                case CameraControlCommand.SetBeautySmoothness:
+                    _beautySmoothness = message.Value;
+                    break;
+                case CameraControlCommand.SetBeautyBrightness:
+                    _beautyBrightness = message.Value;
+                    break;
+                case CameraControlCommand.SetBeautyWarmth:
+                    _beautyWarmth = message.Value;
+                    break;
+                case CameraControlCommand.SetBeautyVignette:
+                    _beautyVignette = message.Value;
+                    break;
+                case CameraControlCommand.SetMaskStrength:
+                    _maskStrength = message.Value;
+                    break;
+                default:
+                    return;
+            }
+
+            UpdateGpuEffectSettings();
+            if (rebuildEffectPipeline && _encoderSurface is not null)
+            {
+                await RebuildEffectCaptureSessionAsync();
+                return;
+            }
+
+            // Shader-only changes are consumed by the renderer. Repeating the
+            // Camera2 request for every slider event can stall legacy devices.
+            if (!cameraRequestChanged && !effectModeChanged)
+                return;
+
+            // Beauty/Mask changes only need a new Camera2 request when the
+            // device can toggle face detection. Legacy HALs may block while
+            // redundantly replacing an identical repeating request.
+            if (!cameraRequestChanged &&
+                effectModeChanged &&
+                GetBestFaceDetectionMode() == 0)
+            {
+                return;
+            }
+
+            if (_captureSession is null || _repeatingRequestBuilder is null)
+                return;
+            ApplyCameraSettings(_repeatingRequestBuilder);
+            _captureSession.SetRepeatingRequest(
+                _repeatingRequestBuilder.Build(),
+                FaceCapture,
+                _cameraHandler);
+        }
+        finally
+        {
+            StateGate.Release();
+        }
+    }
+
+    private static async Task RebuildEffectCaptureSessionAsync()
+    {
+        await CloseCaptureSessionForProducerSwitchAsync();
+        _repeatingRequestBuilder?.Dispose();
+        _repeatingRequestBuilder = null;
+
+        if (_effectMode == VideoEffectMode.Off)
+        {
+            _gpuRenderer?.Dispose();
+            _gpuRenderer = null;
+        }
+        else
+        {
+            try
+            {
+                EnsureGpuRenderer();
+            }
+            catch (Exception ex)
+            {
+                Android.Util.Log.Error(
+                    "BobrCam",
+                    $"Phone GPU compositor unavailable: {ex}");
+                _effectMode = VideoEffectMode.Off;
+                _gpuRenderer?.Dispose();
+                _gpuRenderer = null;
+                ConnectionStatusChanged?.Invoke(
+                    $"Phone GPU effects unavailable: {ex.GetBaseException().Message}");
+            }
+        }
+
+        await CreateCaptureSessionAsync(streaming: true);
+    }
+
+    private static async Task CloseCaptureSessionForProducerSwitchAsync()
+    {
+        var session = _captureSession;
+        if (session is null)
+            return;
+        var closed = _captureSessionClosed?.Task;
+        try { session.StopRepeating(); } catch { }
+        try { session.AbortCaptures(); } catch { }
+        session.Close();
+        if (closed is not null)
+        {
+            try
+            {
+                await closed.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (TimeoutException)
+            {
+                Android.Util.Log.Warn(
+                    "BobrCam",
+                    "Camera2 session close timed out before GPU producer switch.");
+            }
+        }
+        session.Dispose();
+        _captureSession = null;
+        _captureSessionCallback = null;
+        _captureSessionClosed = null;
     }
 
     private static async Task ReadControlsAsync(CancellationToken token)
@@ -702,12 +976,14 @@ public static class AndroidCameraStreamer
         while (!token.IsCancellationRequested)
         {
             await input.ReadExactlyAsync(message, token);
-            if (!VideoProtocol.TryReadCameraControl(message, out var command))
+            if (!VideoProtocol.TryReadCameraControl(message, out var control))
                 throw new InvalidDataException("Invalid camera control message.");
-            if (command == CameraControlCommand.SwitchCamera)
+            if (control.Command == CameraControlCommand.SwitchCamera)
                 await SwitchCameraAsync(token);
-            else if (command == CameraControlCommand.ToggleFlash)
+            else if (control.Command == CameraControlCommand.ToggleFlash)
                 await ToggleFlashAsync(token);
+            else
+                await ApplyCameraControlAsync(control, token);
         }
     }
 
@@ -737,12 +1013,154 @@ public static class AndroidCameraStreamer
             if (available?.BooleanValue() != true)
                 return;
             _flashEnabled = !_flashEnabled;
-            await CreateCaptureSessionAsync(streaming: _encoderSurface is not null);
+            if (_captureSession is null || _repeatingRequestBuilder is null)
+                return;
+            ApplyCameraSettings(_repeatingRequestBuilder);
+            _captureSession.SetRepeatingRequest(
+                _repeatingRequestBuilder.Build(),
+                FaceCapture,
+                _cameraHandler);
         }
         finally
         {
             StateGate.Release();
         }
+    }
+
+    private static async Task SendCameraCapabilitiesAsync(CancellationToken token)
+    {
+        var exposureRange = GetExposureCompensationRange();
+        var minimumExposure = exposureRange is null
+            ? 0
+            : Math.Clamp(Convert.ToInt32(exposureRange.Lower), sbyte.MinValue, sbyte.MaxValue);
+        var maximumExposure = exposureRange is null
+            ? 0
+            : Math.Clamp(Convert.ToInt32(exposureRange.Upper), sbyte.MinValue, sbyte.MaxValue);
+        var maximumZoom = Math.Clamp(
+            (int)Math.Round(GetMaximumZoom() * 100),
+            100,
+            ushort.MaxValue);
+        var whiteBalanceModes = GetSupportedWhiteBalanceModes();
+        var flashAvailable = ((Java.Lang.Boolean?)_cameraCharacteristics?.Get(
+            CameraCharacteristics.FlashInfoAvailable))?.BooleanValue() == true;
+
+        var flags = CameraCapabilityFlags.None;
+        if (flashAvailable)
+            flags |= CameraCapabilityFlags.Flash;
+        if (minimumExposure < maximumExposure)
+            flags |= CameraCapabilityFlags.ExposureCompensation;
+        if (maximumZoom > 100)
+            flags |= CameraCapabilityFlags.Zoom;
+        if (whiteBalanceModes != CameraWhiteBalanceModes.None)
+            flags |= CameraCapabilityFlags.WhiteBalance;
+        flags |= CameraCapabilityFlags.PhoneGpuEffects;
+        if (GetBestFaceDetectionMode() > 0)
+            flags |= CameraCapabilityFlags.FaceTracking;
+
+        var payload = new byte[VideoProtocol.CameraCapabilitiesSize];
+        var capabilities = new CameraCapabilities(
+            flags,
+            (sbyte)minimumExposure,
+            (sbyte)maximumExposure,
+            (ushort)maximumZoom,
+            whiteBalanceModes,
+            (sbyte)_exposureCompensation,
+            (ushort)_zoomHundredths,
+            _whiteBalanceMode);
+        if (!VideoProtocol.TryWriteCameraCapabilities(payload, capabilities))
+            throw new InvalidOperationException("Could not serialize camera capabilities.");
+        await SendPacketAsync(
+            VideoPacketType.CameraCapabilities,
+            VideoPacketFlags.None,
+            payload,
+            0,
+            0,
+            token);
+    }
+
+    private static Android.Util.Range? GetExposureCompensationRange() =>
+        (Android.Util.Range?)_cameraCharacteristics?.Get(
+            CameraCharacteristics.ControlAeCompensationRange);
+
+    private static float GetMaximumZoom()
+    {
+        var value = (Java.Lang.Float?)_cameraCharacteristics?.Get(
+            CameraCharacteristics.ScalerAvailableMaxDigitalZoom);
+        return Math.Max(1f, value?.FloatValue() ?? 1f);
+    }
+
+    private static CameraWhiteBalanceModes GetSupportedWhiteBalanceModes()
+    {
+        var available = (int[]?)_cameraCharacteristics?.Get(
+            CameraCharacteristics.ControlAwbAvailableModes);
+        if (available is null)
+            return CameraWhiteBalanceModes.None;
+
+        var result = CameraWhiteBalanceModes.None;
+        foreach (var mode in available)
+        {
+            result |= (CameraWhiteBalanceMode)mode switch
+            {
+                CameraWhiteBalanceMode.Auto => CameraWhiteBalanceModes.Auto,
+                CameraWhiteBalanceMode.Incandescent =>
+                    CameraWhiteBalanceModes.Incandescent,
+                CameraWhiteBalanceMode.Fluorescent =>
+                    CameraWhiteBalanceModes.Fluorescent,
+                CameraWhiteBalanceMode.Daylight => CameraWhiteBalanceModes.Daylight,
+                CameraWhiteBalanceMode.CloudyDaylight =>
+                    CameraWhiteBalanceModes.CloudyDaylight,
+                _ => CameraWhiteBalanceModes.None
+            };
+        }
+        return result;
+    }
+
+    private static bool IsWhiteBalanceSupported(
+        CameraWhiteBalanceModes supported,
+        CameraWhiteBalanceMode mode) =>
+        mode switch
+        {
+            CameraWhiteBalanceMode.Auto =>
+                supported.HasFlag(CameraWhiteBalanceModes.Auto),
+            CameraWhiteBalanceMode.Incandescent =>
+                supported.HasFlag(CameraWhiteBalanceModes.Incandescent),
+            CameraWhiteBalanceMode.Fluorescent =>
+                supported.HasFlag(CameraWhiteBalanceModes.Fluorescent),
+            CameraWhiteBalanceMode.Daylight =>
+                supported.HasFlag(CameraWhiteBalanceModes.Daylight),
+            CameraWhiteBalanceMode.CloudyDaylight =>
+                supported.HasFlag(CameraWhiteBalanceModes.CloudyDaylight),
+            _ => false
+        };
+
+    private static int GetBestFaceDetectionMode()
+    {
+        var available = (int[]?)_cameraCharacteristics?.Get(
+            CameraCharacteristics.StatisticsInfoAvailableFaceDetectModes);
+        if (available is null || available.Length == 0)
+            return 0;
+        if (available.Contains(2))
+            return 2;
+        return available.Contains(1) ? 1 : 0;
+    }
+
+    private static Android.Graphics.Rect? GetCurrentCropRegion()
+    {
+        var activeArray = _cameraCharacteristics?.Get(
+            CameraCharacteristics.SensorInfoActiveArraySize)
+            as Android.Graphics.Rect;
+        if (activeArray is null)
+            return null;
+        var zoom = Math.Max(1f, _zoomHundredths / 100f);
+        var cropWidth = Math.Max(2, (int)(activeArray.Width() / zoom));
+        var cropHeight = Math.Max(2, (int)(activeArray.Height() / zoom));
+        var left = activeArray.Left + (activeArray.Width() - cropWidth) / 2;
+        var top = activeArray.Top + (activeArray.Height() - cropHeight) / 2;
+        return new Android.Graphics.Rect(
+            left,
+            top,
+            left + cropWidth,
+            top + cropHeight);
     }
 
     private static async Task DrainEncoderAsync(CancellationToken token)
@@ -895,7 +1313,7 @@ public static class AndroidCameraStreamer
             8,
             H264ChromaFormat.Yuv420,
             1000,
-            (ushort)_displayOrientation,
+            0,
             0);
         var payload = new byte[VideoProtocol.StreamConfigurationSize + codecData.Length];
         if (!VideoProtocol.TryWriteStreamConfiguration(payload, configuration))
@@ -1007,7 +1425,65 @@ public static class AndroidCameraStreamer
         _streamCancellation?.Cancel();
     }
 
-    private sealed class SessionStateCallback(TaskCompletionSource<CameraCaptureSession> completion)
+    private sealed class FaceCaptureCallback : CameraCaptureSession.CaptureCallback
+    {
+        private int _frameCounter;
+
+        public override void OnCaptureCompleted(
+            CameraCaptureSession session,
+            CaptureRequest request,
+            TotalCaptureResult result)
+        {
+            if (_effectMode != VideoEffectMode.Mask ||
+                _gpuRenderer is null)
+            {
+                return;
+            }
+
+            if (GetBestFaceDetectionMode() == 0)
+                return;
+            if (++_frameCounter % 3 != 0)
+                return;
+            var faceValue = result.Get(CaptureResult.StatisticsFaces);
+            var faces = faceValue is null
+                ? null
+                : Android.Runtime.JNIEnv.GetArray<
+                    Android.Hardware.Camera2.Params.Face>(faceValue.Handle);
+            var crop = GetCurrentCropRegion();
+            if (faces is null || faces.Length == 0 || crop is null)
+            {
+                _gpuRenderer.ClearFace();
+                return;
+            }
+
+            Android.Hardware.Camera2.Params.Face? face = null;
+            long largestArea = 0;
+            foreach (var candidate in faces)
+            {
+                var area = (long)candidate.Bounds.Width() *
+                    candidate.Bounds.Height();
+                if (area <= largestArea)
+                    continue;
+                face = candidate;
+                largestArea = area;
+            }
+            if (face is null)
+            {
+                _gpuRenderer.ClearFace();
+                return;
+            }
+            var bounds = face.Bounds;
+            var left = (bounds.Left - crop.Left) / (float)crop.Width();
+            var top = (bounds.Top - crop.Top) / (float)crop.Height();
+            var right = (bounds.Right - crop.Left) / (float)crop.Width();
+            var bottom = (bounds.Bottom - crop.Top) / (float)crop.Height();
+            _gpuRenderer.SetFaceRect(left, top, right, bottom);
+        }
+    }
+
+    private sealed class SessionStateCallback(
+        TaskCompletionSource<CameraCaptureSession> completion,
+        TaskCompletionSource closed)
         : CameraCaptureSession.StateCallback
     {
         public override void OnConfigured(CameraCaptureSession session) =>
@@ -1015,6 +1491,9 @@ public static class AndroidCameraStreamer
 
         public override void OnConfigureFailed(CameraCaptureSession session) =>
             completion.TrySetException(new IOException("Camera2 could not configure the preview/encoder surfaces."));
+
+        public override void OnClosed(CameraCaptureSession session) =>
+            closed.TrySetResult();
     }
 }
 #endif

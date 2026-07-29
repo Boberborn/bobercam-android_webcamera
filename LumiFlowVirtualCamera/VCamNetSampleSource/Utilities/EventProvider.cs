@@ -52,7 +52,28 @@ namespace VCamNetSampleSource.Utilities
                 return;
 
             var name = filePath != null ? Path.GetFileNameWithoutExtension(filePath) : null;
-            current.WriteMessageEvent($"[{Environment.CurrentManagedThreadId}]{name}::{methodName}:{message}", (byte)level);
+            var entry =
+                $"[{Environment.CurrentManagedThreadId}]{name}::{methodName}:{message}";
+            current.WriteMessageEvent(entry, (byte)level);
+            if (level == TraceLevel.Error)
+            {
+                try
+                {
+                    var directory = Path.Combine(
+                        Environment.GetFolderPath(
+                            Environment.SpecialFolder.CommonApplicationData),
+                        "BobrCam",
+                        "Frames");
+                    Directory.CreateDirectory(directory);
+                    File.AppendAllText(
+                        Path.Combine(directory, "virtual-camera-error.log"),
+                        $"{DateTime.UtcNow:O} {entry}{Environment.NewLine}");
+                }
+                catch
+                {
+                    // Diagnostics must never break camera frame delivery.
+                }
+            }
         }
 
         [DllImport("advapi32")]

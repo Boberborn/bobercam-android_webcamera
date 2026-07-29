@@ -72,7 +72,7 @@ namespace VCamNetSampleSource
                 : 3u;
             var stride = format == MFConstants.MFVideoFormat_RGB32
                 ? NUM_IMAGE_COLS * 4u
-                : NUM_IMAGE_COLS * 3u / 2u;
+                : NUM_IMAGE_COLS;
             type.SetUINT32(
                 MFConstants.MF_MT_DEFAULT_STRIDE,
                 stride).ThrowOnError();

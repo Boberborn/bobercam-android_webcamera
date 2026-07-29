@@ -12,7 +12,6 @@ public sealed class VideoReceiver
 {
     private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan PacketTimeout = TimeSpan.FromSeconds(10);
-    private readonly ReceiverPairingStore _pairingStore = new();
     private readonly ConnectionRateLimiter _rateLimiter = new();
     private readonly SemaphoreSlim _connectionSlots = new(4, 4);
     private TcpListener? _wifiListener;
@@ -25,38 +24,18 @@ public sealed class VideoReceiver
     private TcpClient? _activeClient;
     private Stream? _activeTransport;
     private readonly SemaphoreSlim _controlWriteGate = new(1, 1);
-    private byte[]? _activePairingToken;
-    private byte[]? _supersededPairingToken;
+    private byte[]? _activeSessionToken;
+    private bool _activeConnectionIsUsb;
     private long _activeConnectionGeneration;
-    private long _pairingAllowedUntilUtcTicks;
     public event Action<H264StreamConfiguration, byte[]>? StreamConfigured;
     public event Action<EncodedVideoAccessUnit>? AccessUnitReceived;
+    public event Action<CameraCapabilities>? CameraCapabilitiesReceived;
     public event Action<string>? StatusChanged;
     public byte RequestedFrameRate { get; set; } = 60;
     public ushort RequestedWidth { get; set; } = 1920;
     public ushort RequestedHeight { get; set; } = 1080;
     public bool PrioritizeResolution { get; set; }
     public bool UseFrontCamera { get; private set; }
-    public int PairedPhoneCount => _pairingStore.Count;
-
-    public void AllowNewPhone(TimeSpan duration)
-    {
-        if (duration <= TimeSpan.Zero || duration > TimeSpan.FromMinutes(5))
-            throw new ArgumentOutOfRangeException(nameof(duration));
-        Interlocked.Exchange(
-            ref _pairingAllowedUntilUtcTicks,
-            DateTime.UtcNow.Add(duration).Ticks);
-        StatusChanged?.Invoke(
-            $"Pairing is open for {duration.TotalSeconds:0} seconds.");
-    }
-
-    public void ForgetPairedPhones()
-    {
-        _pairingStore.Clear();
-        Interlocked.Exchange(ref _pairingAllowedUntilUtcTicks, 0);
-        StatusChanged?.Invoke("All paired phones were forgotten.");
-    }
-
     public Task StartAsync(
         string bindAddress,
         int port,
@@ -108,8 +87,7 @@ public sealed class VideoReceiver
         _advertiser.Start(_cancellation.Token);
         _ = AcceptLoopAsync(_wifiListener, isUsb: false, _cancellation.Token);
         _ = AcceptLoopAsync(_usbListener, isUsb: true, _cancellation.Token);
-        StatusChanged?.Invoke(
-            $"Waiting for a phone… {_pairingStore.Count} phone(s) paired.");
+        StatusChanged?.Invoke("Waiting for a phone — automatic connection enabled.");
         return Task.CompletedTask;
     }
 
@@ -126,8 +104,8 @@ public sealed class VideoReceiver
             _activeConnectionCancellation = null;
             _activeClient = null;
             _activeTransport = null;
-            _activePairingToken = null;
-            _supersededPairingToken = null;
+            _activeSessionToken = null;
+            _activeConnectionIsUsb = false;
         }
         _cancellation?.Dispose();
         _cancellation = null;
@@ -138,6 +116,7 @@ public sealed class VideoReceiver
 
     public async Task SendCameraControlAsync(
         CameraControlCommand command,
+        int value = 0,
         CancellationToken token = default)
     {
         Stream transport;
@@ -146,7 +125,9 @@ public sealed class VideoReceiver
                 throw new InvalidOperationException("Connect a phone first.");
 
         var message = new byte[VideoProtocol.CameraControlSize];
-        if (!VideoProtocol.TryWriteCameraControl(message, command))
+        if (!VideoProtocol.TryWriteCameraControl(
+                message,
+                new CameraControlMessage(command, value)))
             throw new ArgumentOutOfRangeException(nameof(command));
         await _controlWriteGate.WaitAsync(token);
         try
@@ -234,10 +215,9 @@ public sealed class VideoReceiver
                         CertificateRevocationCheckMode = X509RevocationMode.NoCheck
                     }, handshakeTimeout.Token);
                 }
-                var pairingToken =
+                var sessionToken =
                     await ValidatePhoneHandshakeAsync(
                         transport,
-                        isUsb,
                         handshakeTimeout.Token);
                 await SendStreamRequestAsync(
                     transport,
@@ -254,21 +234,19 @@ public sealed class VideoReceiver
                 lock (_activeConnectionGate)
                 {
                     if (_activeClient is not null &&
-                        _supersededPairingToken is not null &&
-                        CryptographicOperations.FixedTimeEquals(
-                            pairingToken,
-                            _supersededPairingToken))
+                        _activeSessionToken is not null &&
+                        !CryptographicOperations.FixedTimeEquals(
+                            sessionToken,
+                            _activeSessionToken))
                     {
                         return;
                     }
 
                     if (_activeClient is not null &&
-                        _activePairingToken is not null &&
-                        !CryptographicOperations.FixedTimeEquals(
-                            pairingToken,
-                            _activePairingToken))
+                        _activeConnectionIsUsb &&
+                        !isUsb)
                     {
-                        _supersededPairingToken = _activePairingToken;
+                        return;
                     }
 
                     _activeConnectionCancellation?.Cancel();
@@ -277,7 +255,8 @@ public sealed class VideoReceiver
                     _activeConnectionCancellation = connectionCancellation;
                     _activeClient = client;
                     _activeTransport = transport;
-                    _activePairingToken = pairingToken;
+                    _activeSessionToken = sessionToken;
+                    _activeConnectionIsUsb = isUsb;
                     generation = ++_activeConnectionGeneration;
                 }
 
@@ -311,8 +290,8 @@ public sealed class VideoReceiver
                             _activeConnectionCancellation = null;
                             _activeClient = null;
                             _activeTransport = null;
-                            _activePairingToken = null;
-                            _supersededPairingToken = null;
+                            _activeSessionToken = null;
+                            _activeConnectionIsUsb = false;
                             StatusChanged?.Invoke("Phone disconnected — waiting to reconnect…");
                         }
                     }
@@ -331,7 +310,6 @@ public sealed class VideoReceiver
 
     private async Task<byte[]> ValidatePhoneHandshakeAsync(
         Stream stream,
-        bool isUsb,
         CancellationToken token)
     {
         var nonce = RandomNumberGenerator.GetBytes(32);
@@ -346,33 +324,17 @@ public sealed class VideoReceiver
             response,
             HandshakeTimeout,
             token);
-        var pairingToken = new byte[32];
+        var sessionToken = new byte[32];
         if (!VideoProtocol.TryReadAuthenticationResponse(
                 response,
                 nonce,
-                pairingToken) ||
-            pairingToken.AsSpan().IndexOfAnyExcept((byte)0) < 0)
+                sessionToken) ||
+            sessionToken.AsSpan().IndexOfAnyExcept((byte)0) < 0)
         {
             throw new AuthenticationException("Invalid phone authentication.");
         }
 
-        if (_pairingStore.IsKnown(pairingToken))
-            return pairingToken;
-
-        var pairingAllowed =
-            isUsb ||
-            DateTime.UtcNow.Ticks <=
-                Interlocked.Read(ref _pairingAllowedUntilUtcTicks);
-        if (!pairingAllowed)
-        {
-            throw new AuthenticationException(
-                "Unknown phone. Click Allow new phone on Windows, then reconnect.");
-        }
-
-        _pairingStore.Add(pairingToken);
-        StatusChanged?.Invoke(
-            $"New phone paired securely. {_pairingStore.Count} phone(s) paired.");
-        return pairingToken;
+        return sessionToken;
     }
 
     private static async Task SendStreamRequestAsync(
@@ -446,6 +408,17 @@ public sealed class VideoReceiver
 
                 case VideoPacketType.EndOfStream:
                     return;
+
+                case VideoPacketType.CameraCapabilities:
+                    if (!VideoProtocol.TryReadCameraCapabilities(
+                            payload,
+                            out var capabilities))
+                    {
+                        throw new InvalidDataException(
+                            "Invalid camera capabilities.");
+                    }
+                    CameraCapabilitiesReceived?.Invoke(capabilities);
+                    break;
             }
         }
     }
