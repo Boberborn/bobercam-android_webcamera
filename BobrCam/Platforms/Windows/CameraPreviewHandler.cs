@@ -81,7 +81,7 @@ public static class H264PreviewRenderer
                 FullMode = BoundedChannelFullMode.DropOldest
             });
             _ = Task.Run(
-                () => DecodeLoopAsync(configuration, _queue.Reader, _cancellation.Token),
+                () => DecodeLoopAsync(configuration, codecData, _queue.Reader, _cancellation.Token),
                 _cancellation.Token);
         }
     }
@@ -127,12 +127,13 @@ public static class H264PreviewRenderer
 
     private static async Task DecodeLoopAsync(
         H264StreamConfiguration configuration,
+        byte[] codecData,
         ChannelReader<EncodedVideoAccessUnit> reader,
         CancellationToken token)
     {
         try
         {
-            using var decoder = new FfmpegH264Decoder(configuration, PresentFrame);
+            using var decoder = new FfmpegH264Decoder(configuration, codecData, PresentFrame);
             StatusChanged?.Invoke("H.264 decoder ready.");
             var waitingForKeyFrame = true;
             await foreach (var accessUnit in reader.ReadAllAsync(token))
@@ -257,6 +258,7 @@ internal sealed unsafe class FfmpegH264Decoder : IDisposable
 
     public FfmpegH264Decoder(
         H264StreamConfiguration configuration,
+        byte[] codecData,
         Action<byte[], int, int, int> present)
     {
         _present = present;
@@ -275,9 +277,26 @@ internal sealed unsafe class FfmpegH264Decoder : IDisposable
 
         _codecContext->width = configuration.Width;
         _codecContext->height = configuration.Height;
+        _codecContext->coded_width = configuration.Width;
+        _codecContext->coded_height = configuration.Height;
         _codecContext->pkt_timebase = new AVRational { num = 1, den = 1_000_000 };
+        _codecContext->time_base = new AVRational { num = 1, den = 1_000_000 };
+        _codecContext->framerate = new AVRational { num = 30, den = 1 };
         _codecContext->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY;
         _codecContext->thread_count = 1;
+
+        if (codecData is { Length: > 0 })
+        {
+            var copy = new byte[codecData.Length + 1];
+            Buffer.BlockCopy(codecData, 0, copy, 0, codecData.Length);
+            fixed (byte* p = copy)
+            {
+                _codecContext->extradata = (byte*)ffmpeg.av_malloc((nuint)copy.Length);
+                _codecContext->extradata_size = copy.Length;
+                Buffer.MemoryCopy(p, _codecContext->extradata, codecData.Length, codecData.Length);
+                _codecContext->extradata[codecData.Length] = 0;
+            }
+        }
 
         EnableD3D11va(codec);
         ThrowIfError(ffmpeg.avcodec_open2(_codecContext, codec, null), "open H.264 decoder");
