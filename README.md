@@ -41,7 +41,7 @@ dotnet build .\BobrCam\BobrCam.csproj -f net10.0-windows10.0.19041.0 -m:1 -p:Use
    ```
    adb install BobrCam\bin\Debug\net10.0-android\com.bobrcam.app-Signed.apk
    ```
-2. Install the Windows virtual camera from `LumiFlowVirtualCamera/`:
+2. Install the Windows virtual camera from `BobrCamVirtualCamera/`:
    ```powershell
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-BobrCamVirtualCamera.ps1 -Quiet
    ```
@@ -67,8 +67,8 @@ Once connected, `BobrCam (Windows Virtual Camera)` appears in the camera list of
 | Path | Purpose |
 | --- | --- |
 | `BobrCam/` | .NET MAUI app for Android and Windows |
-| `LumiFlowVirtualCamera/` | Windows 11 Media Foundation virtual camera |
-| `LumiFlowVirtualCamera/CameraVerifier/` | Virtual camera activation verifier |
+| `BobrCamVirtualCamera/` | Windows 11 Media Foundation virtual camera |
+| `BobrCamVirtualCamera/CameraVerifier/` | Virtual camera activation verifier |
 
 ## Security
 
