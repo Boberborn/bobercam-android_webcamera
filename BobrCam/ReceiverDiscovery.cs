@@ -34,7 +34,7 @@ public sealed class ReceiverAdvertiser
 {
     private readonly byte[] _message;
     public ReceiverAdvertiser(string fingerprint, int port) => _message = Encoding.UTF8.GetBytes($"PHONECAM/1|{port}|{fingerprint}");
-    public void Start(CancellationToken token) => _ = RunAsync(token);
+    public Task Start(CancellationToken token) => RunAsync(token);
     private async Task RunAsync(CancellationToken token)
     {
         using var udp = new UdpClient { EnableBroadcast = true };
