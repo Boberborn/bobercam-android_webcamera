@@ -230,8 +230,7 @@ public static class VideoProtocol
     {
         if (destination.Length < StreamRequestSize ||
             frameRate is not (30 or 60) ||
-            width is not (1280 or 1920 or 2560 or 3840) ||
-            height is not (720 or 1080 or 1440 or 2160))
+            !IsValidStreamResolution(width, height))
             return false;
 
         BinaryPrimitives.WriteUInt32BigEndian(destination, StreamRequestMagic);
@@ -265,19 +264,22 @@ public static class VideoProtocol
             return false;
         }
 
-        frameRate = source[4];
-        width = BinaryPrimitives.ReadUInt16BigEndian(source[5..]);
-        height = BinaryPrimitives.ReadUInt16BigEndian(source[7..]);
-        prioritizeResolution = source[9] == 1;
-        useFrontCamera = source[10] == 1;
-        if ((width, height) is not (
-                (1280, 720) or
-                (1920, 1080) or
-                (2560, 1440) or
-                (3840, 2160)))
-            return false;
-        return true;
+    frameRate = source[4];
+    width = BinaryPrimitives.ReadUInt16BigEndian(source[5..]);
+    height = BinaryPrimitives.ReadUInt16BigEndian(source[7..]);
+    prioritizeResolution = source[9] == 1;
+    useFrontCamera = source[10] == 1;
+    if (!IsValidStreamResolution(width, height))
+        return false;
+    return true;
     }
+
+    private static bool IsValidStreamResolution(ushort width, ushort height) =>
+        (width, height) is (
+            (1280, 720) or
+            (1920, 1080) or
+            (2560, 1440) or
+            (3840, 2160));
 
     public static bool TryWriteCameraControl(
         Span<byte> destination,

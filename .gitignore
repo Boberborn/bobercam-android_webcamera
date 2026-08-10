@@ -6,9 +6,17 @@ publish_win/
 # Local tools and reference material
 .agents/
 .codex/
+.opencode/
 outputs/
 work/
 .vs/
+
+# AI agent instruction files
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.copilot-instructions.md
+.windsurf/
 
 # User and IDE files
 *.user

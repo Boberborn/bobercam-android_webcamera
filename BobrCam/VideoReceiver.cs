@@ -19,6 +19,7 @@ public sealed class VideoReceiver
     private CancellationTokenSource? _cancellation;
     private X509Certificate2? _identity;
     private ReceiverAdvertiser? _advertiser;
+    private Task? _advertiserTask;
     private readonly object _activeConnectionGate = new();
     private CancellationTokenSource? _activeConnectionCancellation;
     private TcpClient? _activeClient;
@@ -84,18 +85,25 @@ public sealed class VideoReceiver
             throw;
         }
         _advertiser = new ReceiverAdvertiser(SecureIdentity.Fingerprint(_identity), port);
-        _advertiser.Start(_cancellation.Token);
+        _advertiserTask = _advertiser.Start(_cancellation.Token);
         _ = AcceptLoopAsync(_wifiListener, isUsb: false, _cancellation.Token);
         _ = AcceptLoopAsync(_usbListener, isUsb: true, _cancellation.Token);
         StatusChanged?.Invoke("Waiting for a phone — automatic connection enabled.");
         return Task.CompletedTask;
     }
 
-    public Task StopAsync()
+    public async Task StopAsync()
     {
         _cancellation?.Cancel();
         _wifiListener?.Stop();
         _usbListener?.Stop();
+        if (_advertiserTask is not null)
+        {
+            try { await _advertiserTask; }
+            catch (OperationCanceledException) { }
+        }
+        _advertiserTask = null;
+        _advertiser = null;
         lock (_activeConnectionGate)
         {
             _activeConnectionCancellation?.Cancel();
@@ -111,7 +119,6 @@ public sealed class VideoReceiver
         _cancellation = null;
         _wifiListener = null;
         _usbListener = null;
-        return Task.CompletedTask;
     }
 
     public async Task SendCameraControlAsync(
@@ -120,9 +127,13 @@ public sealed class VideoReceiver
         CancellationToken token = default)
     {
         Stream transport;
+        long generation;
         lock (_activeConnectionGate)
+        {
             transport = _activeTransport ??
                 throw new InvalidOperationException("Connect a phone first.");
+            generation = _activeConnectionGeneration;
+        }
 
         var message = new byte[VideoProtocol.CameraControlSize];
         if (!VideoProtocol.TryWriteCameraControl(
@@ -134,6 +145,11 @@ public sealed class VideoReceiver
         {
             await transport.WriteAsync(message, token);
             await transport.FlushAsync(token);
+        }
+        catch (Exception ex) when (
+            ex is ObjectDisposedException or IOException &&
+            !IsActiveConnection(generation))
+        {
         }
         finally
         {

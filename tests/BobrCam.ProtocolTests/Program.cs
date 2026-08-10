@@ -44,6 +44,24 @@ Require(
     !VideoProtocol.TryReadStreamConfiguration(configurationBytes, out _),
     "Configuration with B-frames was accepted.");
 
+var requestBytes = new byte[VideoProtocol.StreamRequestSize];
+Require(
+    VideoProtocol.TryWriteStreamRequest(requestBytes, 30, 1280, 720, false, false),
+    "Valid stream request was rejected.");
+Require(
+    VideoProtocol.TryReadStreamRequest(requestBytes, out _, out _, out _, out _, out _),
+    "Valid stream request read failed.");
+Require(
+    !VideoProtocol.TryWriteStreamRequest(requestBytes, 30, 2560, 720, false, false),
+    "Mismatched resolution pair was accepted for write.");
+requestBytes[5] = 0x0A;
+requestBytes[6] = 0x00;
+requestBytes[7] = 0x02;
+requestBytes[8] = 0xD0;
+Require(
+    !VideoProtocol.TryReadStreamRequest(requestBytes, out _, out _, out _, out _, out _),
+    "Mismatched resolution pair was accepted for read.");
+
 Console.WriteLine("BobrCam H.264 protocol contract tests passed.");
 
 static void Require(bool condition, string message)
