@@ -6,20 +6,14 @@ public partial class MainPage : ContentPage
 #if WINDOWS
     private readonly AdbReverseManager _adbReverseManager = new();
 #endif
+#if WINDOWS
     private bool _receiverStarted;
     private bool _updatingStreamSelectors;
-#if WINDOWS
     private bool _previewMirrored;
     private int _previewRotation;
     private int _previewAspectWidth = 16;
     private int _previewAspectHeight = 9;
     private bool _updatingCameraControls;
-    private bool _updatingEffectControls;
-    private bool _effectControlsSupported;
-    private bool _faceTrackingSupported;
-    private ushort? _resolutionBeforeLegacyEffect;
-    private byte? _frameRateBeforeLegacyEffect;
-    private VideoEffectMode _selectedEffectMode;
     private CameraWhiteBalanceMode[] _availableWhiteBalanceModes =
         [CameraWhiteBalanceMode.Auto];
     private readonly Dictionary<CameraControlCommand, CancellationTokenSource>
@@ -33,6 +27,9 @@ public partial class MainPage : ContentPage
     {
         InitializeComponent();
 #if WINDOWS
+        PreviewContentGrid.Children.Insert(
+            1,
+            new CameraPreview { BackgroundColor = Colors.Black });
         AndroidPanel.IsVisible = false;
         WindowsPanel.IsVisible = true;
         WindowsFpsLabel.IsVisible = true;
@@ -42,41 +39,19 @@ public partial class MainPage : ContentPage
         PreviewBorder.HorizontalOptions = LayoutOptions.Center;
         PreviewBorder.VerticalOptions = LayoutOptions.Start;
         PreviewBorder.SizeChanged += (_, _) => UpdateWindowsPreviewSize();
-        WindowsFpsPicker.ItemsSource = new[] { "30 FPS", "60 FPS" };
+        WindowsFpsPicker.ItemsSource = new[] { "30 FPS", "60 FPS", "120 FPS" };
         WindowsResolutionPicker.ItemsSource = new[] { "720p", "1080p", "2K", "4K" };
         WhiteBalancePicker.ItemsSource = new[] { "Auto" };
         WhiteBalancePicker.SelectedIndex = 0;
-        _updatingEffectControls = true;
-        _selectedEffectMode = Enum.IsDefined(
-            (VideoEffectMode)Preferences.Default.Get("effect_mode", 0))
-            ? (VideoEffectMode)Preferences.Default.Get("effect_mode", 0)
-            : VideoEffectMode.Off;
-        BeautySmoothSlider.Value = Math.Clamp(
-            Preferences.Default.Get("beauty_smoothness", 35),
-            0,
-            100);
-        BeautyBrightnessSlider.Value = Math.Clamp(
-            Preferences.Default.Get("beauty_brightness", 0),
-            -50,
-            50);
-        BeautyWarmthSlider.Value = Math.Clamp(
-            Preferences.Default.Get("beauty_warmth", 0),
-            -50,
-            50);
-        BeautyVignetteSlider.Value = Math.Clamp(
-            Preferences.Default.Get("beauty_vignette", 0),
-            0,
-            100);
-        MaskStrengthSlider.Value = Math.Clamp(
-            Preferences.Default.Get("mask_strength", 90),
-            0,
-            100);
-        _updatingEffectControls = false;
-        ApplyEffectModeUi();
         var requestedFps = Preferences.Default.Get("requested_fps", 60);
         var requestedHeight = Preferences.Default.Get("requested_height", 1080);
         _updatingStreamSelectors = true;
-        WindowsFpsPicker.SelectedIndex = requestedFps == 30 ? 0 : 1;
+        WindowsFpsPicker.SelectedIndex = requestedFps switch
+        {
+            >= 120 => 2,
+            >= 60 => 1,
+            _ => 0
+        };
         WindowsResolutionPicker.SelectedIndex = requestedHeight switch
         {
             720 => 0,
@@ -85,7 +60,12 @@ public partial class MainPage : ContentPage
             _ => 1
         };
         _updatingStreamSelectors = false;
-        _receiver.RequestedFrameRate = (byte)(requestedFps == 30 ? 30 : 60);
+        _receiver.RequestedFrameRate = (byte)(requestedFps switch
+        {
+            >= 120 => 120,
+            >= 60 => 60,
+            _ => 30
+        });
         SetRequestedResolution(requestedHeight);
         H264PreviewRenderer.StatusChanged += status =>
             MainThread.BeginInvokeOnMainThread(() => WindowsStatusLabel.Text = status);
@@ -101,7 +81,6 @@ public partial class MainPage : ContentPage
         WindowsFpsLabel.IsVisible = false;
         PreviewBorder.IsVisible = false;
         PreviewRow.Height = new GridLength(0);
-        CameraPreview.IsVisible = false;
         AndroidCameraStreamer.ConnectionStatusChanged += status =>
             MainThread.BeginInvokeOnMainThread(() =>
             {
@@ -121,7 +100,12 @@ public partial class MainPage : ContentPage
                 var actualFps = (int)Math.Round(
                     (double)configuration.FrameRateNumerator /
                     configuration.FrameRateDenominator);
-                WindowsFpsPicker.SelectedIndex = actualFps >= 60 ? 1 : 0;
+                WindowsFpsPicker.SelectedIndex = actualFps switch
+                {
+                    >= 120 => 2,
+                    >= 60 => 1,
+                    _ => 0
+                };
                 WindowsResolutionPicker.SelectedIndex = configuration.Height switch
                 {
                     <= 720 => 0,
@@ -136,17 +120,19 @@ public partial class MainPage : ContentPage
                     _previewMirrored,
                     _previewRotation);
                 SharedH264StreamWriter.SetRotation(_previewRotation);
-                _receiver.RequestedFrameRate = (byte)(actualFps >= 60 ? 60 : 30);
-                SetRequestedResolution(configuration.Height);
-                if (_resolutionBeforeLegacyEffect is null)
+                _receiver.RequestedFrameRate = (byte)(actualFps switch
                 {
-                    Preferences.Default.Set(
-                        "requested_fps",
-                        (int)_receiver.RequestedFrameRate);
-                    Preferences.Default.Set(
-                        "requested_height",
-                        (int)_receiver.RequestedHeight);
-                }
+                    >= 120 => 120,
+                    >= 60 => 60,
+                    _ => 30
+                });
+                SetRequestedResolution(configuration.Height);
+                Preferences.Default.Set(
+                    "requested_fps",
+                    (int)_receiver.RequestedFrameRate);
+                Preferences.Default.Set(
+                    "requested_height",
+                    (int)_receiver.RequestedHeight);
                 _updatingStreamSelectors = false;
             });
 #endif
@@ -172,6 +158,7 @@ public partial class MainPage : ContentPage
             {
                 Window.Width = 720;
                 Window.Height = 850;
+                Window.Y = 0;
             }
 #endif
         };
@@ -244,6 +231,36 @@ public partial class MainPage : ContentPage
 #endif
     }
 
+    private void OnForgetSavedPcClicked(object sender, EventArgs e)
+    {
+#if ANDROID
+        try
+        {
+            SecureIdentity.ForgetPairedReceiver();
+            AndroidStatusLabel.Text =
+                "Saved PC forgotten. The next Wi-Fi receiver can be trusted.";
+        }
+        catch (Exception ex)
+        {
+            AndroidStatusLabel.Text = ex.GetBaseException().Message;
+        }
+#endif
+    }
+
+    private void OnForgetTrustedPhoneClicked(object sender, EventArgs e)
+    {
+#if WINDOWS
+        try
+        {
+            _receiver.ForgetTrustedPhone();
+        }
+        catch (Exception ex)
+        {
+            WindowsStatusLabel.Text = ex.GetBaseException().Message;
+        }
+#endif
+    }
+
 #if ANDROID
     private async Task ConnectCameraAsync(string host, int port, string fingerprint, string mode)
     {
@@ -255,7 +272,7 @@ public partial class MainPage : ContentPage
             if (current == PermissionStatus.Denied)
             {
                 AndroidStatusLabel.Text = "Camera permission was denied. Open Settings to allow it.";
-                if (await DisplayAlert("Camera permission required",
+                if (await DisplayAlertAsync("Camera permission required",
                         "BobrCam needs the camera to send video to Windows. Open Settings to grant it?",
                         "Open Settings", "Cancel"))
                 {
@@ -411,31 +428,6 @@ public partial class MainPage : ContentPage
                 exposureAvailable ||
                 zoomAvailable ||
                 WhiteBalancePicker.IsEnabled;
-            _effectControlsSupported = capabilities.Flags.HasFlag(
-                CameraCapabilityFlags.PhoneGpuEffects);
-            _faceTrackingSupported = capabilities.Flags.HasFlag(
-                CameraCapabilityFlags.FaceTracking);
-            EffectsCard.IsEnabled = _effectControlsSupported;
-            MaskModeButton.IsEnabled =
-                _effectControlsSupported && _faceTrackingSupported;
-            MaskTrackingLabel.Text = _faceTrackingSupported
-                ? "Face-tracked Bobr"
-                : "Requires phone face tracking";
-            if (!_faceTrackingSupported &&
-                _selectedEffectMode == VideoEffectMode.Mask)
-            {
-                _selectedEffectMode = VideoEffectMode.Off;
-                Preferences.Default.Set(
-                    "effect_mode",
-                    (int)VideoEffectMode.Off);
-            }
-            ApplyEffectModeUi();
-            _ = !_faceTrackingSupported &&
-                _selectedEffectMode == VideoEffectMode.Beauty &&
-                _receiver.RequestedHeight > 720
-                ? SelectEffectModeAsync(VideoEffectMode.Beauty)
-                : RestorePhoneEffectSettingsAsync();
-
             void AddWhiteBalanceMode(
                 CameraWhiteBalanceModes flag,
                 string label,
@@ -483,200 +475,6 @@ public partial class MainPage : ContentPage
             CameraControlCommand.SetWhiteBalance,
             "Applying phone white balance…",
             (int)_availableWhiteBalanceModes[WhiteBalancePicker.SelectedIndex]);
-    }
-
-    private async void OnEffectOffClicked(object sender, EventArgs e) =>
-        await SelectEffectModeAsync(VideoEffectMode.Off);
-
-    private async void OnBeautyModeClicked(object sender, EventArgs e) =>
-        await SelectEffectModeAsync(VideoEffectMode.Beauty);
-
-    private async void OnMaskModeClicked(object sender, EventArgs e)
-    {
-        await SelectEffectModeAsync(VideoEffectMode.Mask);
-    }
-
-    private async Task SelectEffectModeAsync(VideoEffectMode mode)
-    {
-        if (!_effectControlsSupported)
-        {
-            WindowsStatusLabel.Text =
-                "Connect a phone that supports GPU effects first.";
-            return;
-        }
-
-        if (mode == VideoEffectMode.Mask && !_faceTrackingSupported)
-        {
-            WindowsStatusLabel.Text =
-                "Bobr Mask requires a phone with face tracking.";
-            return;
-        }
-
-        _selectedEffectMode = mode;
-        Preferences.Default.Set("effect_mode", (int)mode);
-        ApplyEffectModeUi();
-
-        if (!_faceTrackingSupported &&
-            mode == VideoEffectMode.Beauty &&
-            _receiver.RequestedHeight > 720)
-        {
-            _resolutionBeforeLegacyEffect ??= _receiver.RequestedHeight;
-            _frameRateBeforeLegacyEffect ??= _receiver.RequestedFrameRate;
-            SetRequestedResolution(720);
-            _receiver.RequestedFrameRate = 30;
-            _receiver.PrioritizeResolution = true;
-            _updatingStreamSelectors = true;
-            WindowsResolutionPicker.SelectedIndex = 0;
-            WindowsFpsPicker.SelectedIndex = 0;
-            _updatingStreamSelectors = false;
-            await RestartReceiverForModeChangeAsync(
-                "720p30 Beauty for this phone");
-            return;
-        }
-
-        if (mode == VideoEffectMode.Off &&
-            _resolutionBeforeLegacyEffect is ushort previousHeight &&
-            _frameRateBeforeLegacyEffect is byte previousFrameRate)
-        {
-            SetRequestedResolution(previousHeight);
-            _receiver.RequestedFrameRate = previousFrameRate;
-            _receiver.PrioritizeResolution = true;
-            _updatingStreamSelectors = true;
-            WindowsResolutionPicker.SelectedIndex = previousHeight switch
-            {
-                <= 720 => 0,
-                >= 2160 => 3,
-                >= 1440 => 2,
-                _ => 1
-            };
-            WindowsFpsPicker.SelectedIndex = previousFrameRate >= 60 ? 1 : 0;
-            _updatingStreamSelectors = false;
-            _resolutionBeforeLegacyEffect = null;
-            _frameRateBeforeLegacyEffect = null;
-            await RestartReceiverForModeChangeAsync(
-                $"{previousHeight}p direct H.264");
-            return;
-        }
-
-        await SendCameraControlAsync(
-            CameraControlCommand.SetEffectMode,
-            mode switch
-            {
-                VideoEffectMode.Beauty => "Starting phone Beauty mode…",
-                VideoEffectMode.Mask when _faceTrackingSupported =>
-                    "Starting face-tracked Bobr mask…",
-                _ => "Returning to direct H.264 mode…"
-            },
-            (int)mode);
-    }
-
-    private void ApplyEffectModeUi()
-    {
-        BeautySettingsGrid.IsVisible =
-            _selectedEffectMode == VideoEffectMode.Beauty;
-        MaskSettingsGrid.IsVisible =
-            _selectedEffectMode == VideoEffectMode.Mask;
-        SetModeButtonState(
-            EffectOffButton,
-            _selectedEffectMode == VideoEffectMode.Off);
-        SetModeButtonState(
-            BeautyModeButton,
-            _selectedEffectMode == VideoEffectMode.Beauty);
-        SetModeButtonState(
-            MaskModeButton,
-            _selectedEffectMode == VideoEffectMode.Mask);
-
-        static void SetModeButtonState(Button button, bool selected)
-        {
-            button.BackgroundColor = Color.FromArgb(
-                selected ? "#F45145" : "#59413B");
-            button.TextColor = Colors.White;
-        }
-    }
-
-    private async Task RestorePhoneEffectSettingsAsync()
-    {
-        if (!_effectControlsSupported)
-            return;
-        try
-        {
-            await _receiver.SendCameraControlAsync(
-                CameraControlCommand.SetBeautySmoothness,
-                (int)Math.Round(BeautySmoothSlider.Value));
-            await _receiver.SendCameraControlAsync(
-                CameraControlCommand.SetBeautyBrightness,
-                (int)Math.Round(BeautyBrightnessSlider.Value));
-            await _receiver.SendCameraControlAsync(
-                CameraControlCommand.SetBeautyWarmth,
-                (int)Math.Round(BeautyWarmthSlider.Value));
-            await _receiver.SendCameraControlAsync(
-                CameraControlCommand.SetBeautyVignette,
-                (int)Math.Round(BeautyVignetteSlider.Value));
-            await _receiver.SendCameraControlAsync(
-                CameraControlCommand.SetMaskStrength,
-                (int)Math.Round(MaskStrengthSlider.Value));
-            await _receiver.SendCameraControlAsync(
-                CameraControlCommand.SetEffectMode,
-                (int)_selectedEffectMode);
-        }
-        catch (Exception ex)
-        {
-            WindowsStatusLabel.Text = ex.GetBaseException().Message;
-        }
-    }
-
-    private void OnBeautySmoothChanged(object sender, ValueChangedEventArgs e)
-    {
-        var value = (int)Math.Round(e.NewValue);
-        BeautySmoothLabel.Text = $"Smooth {value}";
-        if (_updatingEffectControls)
-            return;
-        Preferences.Default.Set("beauty_smoothness", value);
-        QueueCameraControl(CameraControlCommand.SetBeautySmoothness, value);
-    }
-
-    private void OnBeautyBrightnessChanged(
-        object sender,
-        ValueChangedEventArgs e)
-    {
-        var value = (int)Math.Round(e.NewValue);
-        BeautyBrightnessLabel.Text = $"Light {value:+0;-0;0}";
-        if (_updatingEffectControls)
-            return;
-        Preferences.Default.Set("beauty_brightness", value);
-        QueueCameraControl(CameraControlCommand.SetBeautyBrightness, value);
-    }
-
-    private void OnBeautyWarmthChanged(object sender, ValueChangedEventArgs e)
-    {
-        var value = (int)Math.Round(e.NewValue);
-        BeautyWarmthLabel.Text = $"Warmth {value:+0;-0;0}";
-        if (_updatingEffectControls)
-            return;
-        Preferences.Default.Set("beauty_warmth", value);
-        QueueCameraControl(CameraControlCommand.SetBeautyWarmth, value);
-    }
-
-    private void OnBeautyVignetteChanged(
-        object sender,
-        ValueChangedEventArgs e)
-    {
-        var value = (int)Math.Round(e.NewValue);
-        BeautyVignetteLabel.Text = $"Vignette {value}";
-        if (_updatingEffectControls)
-            return;
-        Preferences.Default.Set("beauty_vignette", value);
-        QueueCameraControl(CameraControlCommand.SetBeautyVignette, value);
-    }
-
-    private void OnMaskStrengthChanged(object sender, ValueChangedEventArgs e)
-    {
-        var value = (int)Math.Round(e.NewValue);
-        MaskStrengthLabel.Text = $"{value}%";
-        if (_updatingEffectControls)
-            return;
-        Preferences.Default.Set("mask_strength", value);
-        QueueCameraControl(CameraControlCommand.SetMaskStrength, value);
     }
 
     private void QueueCameraControl(CameraControlCommand command, int value)
@@ -747,48 +545,18 @@ public partial class MainPage : ContentPage
     {
     }
 
-    private void OnEffectOffClicked(object sender, EventArgs e)
-    {
-    }
-
-    private void OnBeautyModeClicked(object sender, EventArgs e)
-    {
-    }
-
-    private void OnMaskModeClicked(object sender, EventArgs e)
-    {
-    }
-
-    private void OnBeautySmoothChanged(object sender, ValueChangedEventArgs e)
-    {
-    }
-
-    private void OnBeautyBrightnessChanged(
-        object sender,
-        ValueChangedEventArgs e)
-    {
-    }
-
-    private void OnBeautyWarmthChanged(object sender, ValueChangedEventArgs e)
-    {
-    }
-
-    private void OnBeautyVignetteChanged(
-        object sender,
-        ValueChangedEventArgs e)
-    {
-    }
-
-    private void OnMaskStrengthChanged(object sender, ValueChangedEventArgs e)
-    {
-    }
 #endif
 
     private async void OnWindowsFpsChanged(object sender, EventArgs e)
     {
 #if WINDOWS
         if (_updatingStreamSelectors) return;
-        var requestedFps = WindowsFpsPicker.SelectedIndex == 0 ? 30 : 60;
+        var requestedFps = WindowsFpsPicker.SelectedIndex switch
+        {
+            2 => 120,
+            1 => 60,
+            _ => 30
+        };
         _receiver.RequestedFrameRate = (byte)requestedFps;
         _receiver.PrioritizeResolution = false;
         Preferences.Default.Set("requested_fps", requestedFps);

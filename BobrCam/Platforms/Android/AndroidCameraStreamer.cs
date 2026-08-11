@@ -33,6 +33,7 @@ public static class AndroidCameraStreamer
     private const int HdBitrate = 8_000_000;
     private const int QuadHdBitrate = 24_000_000;
     private const int UltraHdBitrate = 35_000_000;
+    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(10);
 
     private static readonly SemaphoreSlim StateGate = new(1, 1);
     private static readonly SemaphoreSlim WriteGate = new(1, 1);
@@ -46,7 +47,6 @@ public static class AndroidCameraStreamer
     private static Handler? _cameraHandler;
     private static MediaCodec? _encoder;
     private static Surface? _encoderSurface;
-    private static AndroidGpuVideoRenderer? _gpuRenderer;
     private static Surface? _previewOutput;
     private static SurfaceTexture? _previewTexture;
     private static TcpClient? _client;
@@ -66,6 +66,8 @@ public static class AndroidCameraStreamer
     private static int _streamHeight = FullHdHeight;
     private static int _streamBitrate = FullHdBitrate;
     private static Android.Util.Range? _targetFpsRange;
+    private static Android.Util.Range? _activeFpsRange;
+    private static bool _useHighSpeedSession;
     private static CameraCharacteristics? _cameraCharacteristics;
     private static bool _useFrontCamera;
     private static bool _flashEnabled;
@@ -73,13 +75,6 @@ public static class AndroidCameraStreamer
     private static int _zoomHundredths = 100;
     private static CameraWhiteBalanceMode _whiteBalanceMode =
         CameraWhiteBalanceMode.Auto;
-    private static VideoEffectMode _effectMode;
-    private static int _beautySmoothness = 35;
-    private static int _beautyBrightness;
-    private static int _beautyWarmth;
-    private static int _beautyVignette;
-    private static int _maskStrength = 90;
-    private static readonly FaceCaptureCallback FaceCapture = new();
     private static uint _sequence;
 
     public static volatile string? LastError;
@@ -302,25 +297,31 @@ public static class AndroidCameraStreamer
         else
         {
             string presentedFingerprint = string.Empty;
+            var paired = await SecureIdentity.GetPairedReceiverFingerprintAsync();
             var secure = new SslStream(_client.GetStream(), false, (_, certificate, _, _) =>
             {
                 if (certificate is null) return false;
                 presentedFingerprint = SecureIdentity.Fingerprint(new X509Certificate2(certificate));
-                var paired = Preferences.Default.Get("paired_receiver", string.Empty);
                 if (!string.IsNullOrEmpty(discoveredFingerprint) &&
                     !SecureIdentity.FixedTimeEquals(discoveredFingerprint, presentedFingerprint))
                     return false;
                 return string.IsNullOrEmpty(paired) ||
                        SecureIdentity.FixedTimeEquals(paired, presentedFingerprint);
             });
-            await secure.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            using (var tlsTimeout = CancellationTokenSource.CreateLinkedTokenSource(
+                       _streamCancellation.Token))
             {
-                TargetHost = "bobrcam.local",
-                EnabledSslProtocols = SslProtocols.Tls12,
-                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-            }, _streamCancellation.Token);
+                tlsTimeout.CancelAfter(HandshakeTimeout);
+                await secure.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                {
+                    TargetHost = "bobrcam.local",
+                    EnabledSslProtocols = SslProtocols.Tls12,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+                }, tlsTimeout.Token);
+            }
 
-            Preferences.Default.Set("paired_receiver", presentedFingerprint);
+            await SecureIdentity.SetPairedReceiverFingerprintAsync(
+                presentedFingerprint);
             _outputStream = secure;
         }
         await StartProtocolSessionAsync();
@@ -351,23 +352,28 @@ public static class AndroidCameraStreamer
             throw new InvalidOperationException("Video session is not initialized.");
         var output = _outputStream ??
             throw new IOException("Receiver connection is closed.");
+        using var handshakeTimeout =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token);
+        handshakeTimeout.CancelAfter(HandshakeTimeout);
+        var handshakeToken = handshakeTimeout.Token;
         var challenge = new byte[VideoProtocol.AuthenticationChallengeSize];
         await output.ReadExactlyAsync(
             challenge,
-            cancellation.Token);
+            handshakeToken);
         var nonce = new byte[32];
         if (!VideoProtocol.TryReadAuthenticationChallenge(challenge, nonce))
             throw new AuthenticationException("Invalid Windows authentication challenge.");
 
+        var pairingToken = await SecureIdentity.GetOrCreatePairingTokenAsync();
         var authentication = new byte[VideoProtocol.AuthenticationResponseSize];
         VideoProtocol.WriteAuthenticationResponse(
             authentication,
-            SecureIdentity.GetOrCreatePairingToken(),
+            pairingToken,
             nonce);
-        await output.WriteAsync(authentication, cancellation.Token);
-        await output.FlushAsync(cancellation.Token);
+        await output.WriteAsync(authentication, handshakeToken);
+        await output.FlushAsync(handshakeToken);
         var streamRequest = new byte[VideoProtocol.StreamRequestSize];
-        await output.ReadExactlyAsync(streamRequest, cancellation.Token);
+        await output.ReadExactlyAsync(streamRequest, handshakeToken);
         if (!VideoProtocol.TryReadStreamRequest(
                 streamRequest,
                 out var requestedFps,
@@ -502,27 +508,64 @@ public static class AndroidCameraStreamer
             characteristics,
             _requestedWidth,
             _requestedHeight);
-        if (!_prioritizeResolution &&
+        Android.Util.Range? highSpeedRange = null;
+        var cameraSupportsHighSpeed =
             _requestedFps >= PreferredFps &&
-            !SupportsFrameRate(
+            OperatingSystem.IsAndroidVersionAtLeast(29) &&
+            TrySelectHighSpeedMode(
                 characteristics,
                 _streamWidth,
                 _streamHeight,
-                _requestedFps))
+                _requestedFps,
+                out highSpeedRange);
+        _useHighSpeedSession =
+            cameraSupportsHighSpeed &&
+            (_requestedFps <= PreferredFps ||
+             SupportsHardwareAvcEncoding(
+                 _streamWidth,
+                 _streamHeight,
+                 _requestedFps));
+        if (cameraSupportsHighSpeed && !_useHighSpeedSession)
         {
-            (_streamWidth, _streamHeight) = SelectSupportedResolution(
-                characteristics,
-                HdWidth,
-                HdHeight);
+            Android.Util.Log.Info(
+                "BobrCam",
+                $"Hardware AVC cannot sustain {_streamWidth}x{_streamHeight} at {_requestedFps} FPS; falling back to {PreferredFps} FPS.");
+            ConnectionStatusChanged?.Invoke(
+                $"{_streamWidth}x{_streamHeight} at {_requestedFps} FPS is not supported by the hardware encoder; using {PreferredFps} FPS.");
         }
-        _targetFpsRange = DetermineFrameRate(
-            characteristics,
-            _requestedFps,
-            _streamWidth,
-            _streamHeight);
-        _streamFps = _targetFpsRange is null
-            ? FallbackFps
-            : Convert.ToInt32(_targetFpsRange.Upper);
+        var effectiveRequestedFps =
+            _requestedFps > PreferredFps && !_useHighSpeedSession
+                ? PreferredFps
+                : _requestedFps;
+        if (_useHighSpeedSession)
+        {
+            _targetFpsRange = highSpeedRange;
+            _streamFps = _requestedFps;
+        }
+        else
+        {
+            if (!_prioritizeResolution &&
+                effectiveRequestedFps >= PreferredFps &&
+                !SupportsFrameRate(
+                    characteristics,
+                    _streamWidth,
+                    _streamHeight,
+                    effectiveRequestedFps))
+            {
+                (_streamWidth, _streamHeight) = SelectSupportedResolution(
+                    characteristics,
+                    HdWidth,
+                    HdHeight);
+            }
+            _targetFpsRange = DetermineFrameRate(
+                characteristics,
+                effectiveRequestedFps,
+                _streamWidth,
+                _streamHeight);
+            _streamFps = _targetFpsRange is null
+                ? FallbackFps
+                : Convert.ToInt32(_targetFpsRange.Upper);
+        }
         _streamBitrate = _streamHeight switch
         {
             >= UltraHdHeight => UltraHdBitrate,
@@ -530,6 +573,107 @@ public static class AndroidCameraStreamer
             <= HdHeight => HdBitrate,
             _ => FullHdBitrate
         };
+    }
+
+    private static bool TrySelectHighSpeedMode(
+        CameraCharacteristics characteristics,
+        int width,
+        int height,
+        int requestedFps,
+        out Android.Util.Range? selectedRange)
+    {
+        selectedRange = null;
+        var map = (StreamConfigurationMap?)characteristics.Get(
+            CameraCharacteristics.ScalerStreamConfigurationMap);
+        var size = map?.GetHighSpeedVideoSizes()?.FirstOrDefault(candidate =>
+            candidate.Width == width && candidate.Height == height);
+        if (size is null)
+            return false;
+        var ranges = map!.GetHighSpeedVideoFpsRangesFor(size);
+        if (ranges is null)
+            return false;
+        selectedRange = ranges
+            .Where(range =>
+                Convert.ToInt32(range.Lower) == Convert.ToInt32(range.Upper) &&
+                Convert.ToInt32(range.Upper) >= requestedFps)
+            .OrderBy(range => Convert.ToInt32(range.Upper))
+            .FirstOrDefault();
+        return selectedRange is not null;
+    }
+
+    private static bool SupportsHardwareAvcEncoding(
+        int width,
+        int height,
+        int frameRate)
+    {
+        if (!OperatingSystem.IsAndroidVersionAtLeast(29))
+            return false;
+        try
+        {
+            using var format = MediaFormat.CreateVideoFormat(
+                MediaFormat.MimetypeVideoAvc,
+                width,
+                height);
+            format.SetInteger(
+                MediaFormat.KeyColorFormat,
+                (int)MediaCodecCapabilities.Formatsurface);
+            format.SetInteger(MediaFormat.KeyFrameRate, frameRate);
+            format.SetInteger(
+                MediaFormat.KeyProfile,
+                (int)MediaCodecProfileType.Avcprofilemain);
+            format.SetInteger(
+                MediaFormat.KeyLevel,
+                (int)GetEncoderLevel(height, frameRate));
+
+            using var codecList = new MediaCodecList(MediaCodecListKind.AllCodecs);
+            foreach (var codec in codecList.GetCodecInfos() ?? [])
+            {
+                if (codec is null || !codec.IsEncoder ||
+                    !codec.IsHardwareAccelerated ||
+                    !(codec.GetSupportedTypes() ?? []).Any(type =>
+                        string.Equals(
+                            type,
+                            MediaFormat.MimetypeVideoAvc,
+                            StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                var capabilities = codec.GetCapabilitiesForType(
+                    MediaFormat.MimetypeVideoAvc);
+                var video = capabilities?.VideoCapabilities;
+                if (video is null ||
+                    !video.AreSizeAndRateSupported(width, height, frameRate) ||
+                    capabilities is null ||
+                    !capabilities.IsFormatSupported(format))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var achievable = video.GetAchievableFrameRatesFor(width, height);
+                    if (achievable is not null &&
+                        Convert.ToDouble(achievable.Upper) < frameRate)
+                    {
+                        continue;
+                    }
+                }
+                catch (ArgumentException)
+                {
+                    // Some vendors omit measured rates; declared support remains usable.
+                }
+
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Android.Util.Log.Warn(
+                "BobrCam",
+                $"Could not query AVC encoder performance: {ex.GetBaseException().Message}");
+        }
+        return false;
     }
 
     private static Android.Util.Range? DetermineFrameRate(
@@ -642,6 +786,13 @@ public static class AndroidCameraStreamer
         format.SetInteger(MediaFormat.KeyColorFormat, (int)MediaCodecCapabilities.Formatsurface);
         format.SetInteger(MediaFormat.KeyBitRate, _streamBitrate);
         format.SetInteger(MediaFormat.KeyFrameRate, _streamFps);
+        if (_useHighSpeedSession)
+        {
+            format.SetFloat(
+                MediaFormat.KeyCaptureRate,
+                Convert.ToSingle(_targetFpsRange!.Upper));
+            format.SetFloat("max-fps-to-encoder", _streamFps);
+        }
         format.SetInteger(MediaFormat.KeyIFrameInterval, 1);
         format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilemain);
         format.SetInteger(MediaFormat.KeyLevel, (int)GetEncoderLevel());
@@ -656,8 +807,6 @@ public static class AndroidCameraStreamer
 
     private static void StopEncoder()
     {
-        _gpuRenderer?.Dispose();
-        _gpuRenderer = null;
         try { _encoder?.SignalEndOfInputStream(); } catch { }
         try { _encoder?.Stop(); } catch { }
         _encoderSurface?.Dispose();
@@ -679,34 +828,21 @@ public static class AndroidCameraStreamer
         if (_wantPreview && _previewOutput is not null)
             outputs.Add(_previewOutput);
         if (streaming && _encoderSurface is not null)
-        {
-            if (_effectMode != VideoEffectMode.Off)
-            {
-                try
-                {
-                    EnsureGpuRenderer();
-                    outputs.Add(_gpuRenderer!.InputSurface);
-                }
-                catch (Exception ex)
-                {
-                    Android.Util.Log.Error(
-                        "BobrCam",
-                        $"Phone GPU compositor unavailable: {ex}");
-                    _effectMode = VideoEffectMode.Off;
-                    _gpuRenderer?.Dispose();
-                    _gpuRenderer = null;
-                    ConnectionStatusChanged?.Invoke(
-                        $"Phone GPU effects unavailable: {ex.GetBaseException().Message}");
-                    outputs.Add(_encoderSurface);
-                }
-            }
-            else
-            {
-                outputs.Add(_encoderSurface);
-            }
-        }
+            outputs.Add(_encoderSurface);
         if (outputs.Count == 0)
             return;
+
+        var useHighSpeed =
+            _useHighSpeedSession &&
+            streaming &&
+            outputs.Count == 1;
+        _activeFpsRange = useHighSpeed
+            ? _targetFpsRange
+            : DetermineFrameRate(
+                _cameraCharacteristics!,
+                _requestedFps,
+                _streamWidth,
+                _streamHeight);
 
         var completion = new TaskCompletionSource<CameraCaptureSession>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -715,10 +851,16 @@ public static class AndroidCameraStreamer
         _captureSessionCallback = new SessionStateCallback(
             completion,
             _captureSessionClosed);
-        _camera.CreateCaptureSession(
-            outputs,
-            _captureSessionCallback,
-            _cameraHandler);
+        if (useHighSpeed)
+            _camera.CreateConstrainedHighSpeedCaptureSession(
+                outputs,
+                _captureSessionCallback,
+                _cameraHandler);
+        else
+            _camera.CreateCaptureSession(
+                outputs,
+                _captureSessionCallback,
+                _cameraHandler);
         _captureSession = await completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         var request = _camera.CreateCaptureRequest(
@@ -727,61 +869,38 @@ public static class AndroidCameraStreamer
         foreach (var output in outputs)
             request.AddTarget(output);
         ApplyCameraSettings(request);
-        _captureSession.SetRepeatingRequest(
-            request.Build(),
-            FaceCapture,
-            _cameraHandler);
+        SubmitRepeatingRequest();
+        if (useHighSpeed)
+            ConnectionStatusChanged?.Invoke(
+                $"High-speed camera active: {_streamWidth}x{_streamHeight} at {_streamFps} FPS.");
     }
 
-    private static void EnsureGpuRenderer()
+    private static void SubmitRepeatingRequest()
     {
-        if (_gpuRenderer is not null)
+        if (_captureSession is null || _repeatingRequestBuilder is null)
+            return;
+        var request = _repeatingRequestBuilder.Build();
+        if (_captureSession is CameraConstrainedHighSpeedCaptureSession highSpeed)
         {
-            UpdateGpuEffectSettings();
+            var burst = highSpeed.CreateHighSpeedRequestList(request);
+            highSpeed.SetRepeatingBurst(burst, null, _cameraHandler);
             return;
         }
-        var encoderSurface = _encoderSurface ??
-            throw new InvalidOperationException("H.264 encoder surface is unavailable.");
-        _gpuRenderer = new AndroidGpuVideoRenderer(
-            encoderSurface,
-            _streamWidth,
-            _streamHeight);
-        Android.Util.Log.Info(
-            "BobrCam",
-            $"Phone GPU compositor ready at {_streamWidth}x{_streamHeight}.");
-        UpdateGpuEffectSettings();
-    }
-
-    private static void UpdateGpuEffectSettings()
-    {
-        _gpuRenderer?.SetSettings(
-            _effectMode,
-            _beautySmoothness,
-            _beautyBrightness,
-            _beautyWarmth,
-            _beautyVignette,
-            _maskStrength);
-        if (_gpuRenderer is null)
-            return;
-        if (_effectMode != VideoEffectMode.Mask ||
-            GetBestFaceDetectionMode() == 0)
-        {
-            _gpuRenderer.ClearFace();
-        }
+        _captureSession.SetRepeatingRequest(request, null, _cameraHandler);
     }
 
     private static void ApplyCameraSettings(CaptureRequest.Builder request)
     {
         request.Set(
-            CaptureRequest.ControlMode,
+            CaptureRequest.ControlMode!,
             new Java.Lang.Integer((int)ControlMode.Auto));
         request.Set(
-            CaptureRequest.FlashMode,
+            CaptureRequest.FlashMode!,
             new Java.Lang.Integer((int)(_flashEnabled
                 ? Android.Hardware.Camera2.FlashMode.Torch
                 : Android.Hardware.Camera2.FlashMode.Off)));
-        if (_targetFpsRange is not null)
-            request.Set(CaptureRequest.ControlAeTargetFpsRange, _targetFpsRange);
+        if (_activeFpsRange is not null)
+            request.Set(CaptureRequest.ControlAeTargetFpsRange!, _activeFpsRange);
 
         var exposureRange = GetExposureCompensationRange();
         if (exposureRange is not null)
@@ -791,7 +910,7 @@ public static class AndroidCameraStreamer
                 Convert.ToInt32(exposureRange.Lower),
                 Convert.ToInt32(exposureRange.Upper));
             request.Set(
-                CaptureRequest.ControlAeExposureCompensation,
+                CaptureRequest.ControlAeExposureCompensation!,
                 new Java.Lang.Integer(_exposureCompensation));
         }
 
@@ -799,15 +918,8 @@ public static class AndroidCameraStreamer
         if (!IsWhiteBalanceSupported(supportedWhiteBalance, _whiteBalanceMode))
             _whiteBalanceMode = CameraWhiteBalanceMode.Auto;
         request.Set(
-            CaptureRequest.ControlAwbMode,
+            CaptureRequest.ControlAwbMode!,
             new Java.Lang.Integer((int)_whiteBalanceMode));
-        var faceDetectionMode = _effectMode == VideoEffectMode.Mask
-            ? GetBestFaceDetectionMode()
-            : 0;
-        request.Set(
-            CaptureRequest.StatisticsFaceDetectMode,
-            new Java.Lang.Integer(faceDetectionMode));
-
         var maximumZoom = GetMaximumZoom();
         _zoomHundredths = Math.Clamp(
             _zoomHundredths,
@@ -815,7 +927,7 @@ public static class AndroidCameraStreamer
             (int)Math.Round(maximumZoom * 100));
         var cropRegion = GetCurrentCropRegion();
         if (cropRegion is not null)
-            request.Set(CaptureRequest.ScalerCropRegion, cropRegion);
+            request.Set(CaptureRequest.ScalerCropRegion!, cropRegion);
     }
 
     private static async Task ApplyCameraControlAsync(
@@ -825,9 +937,7 @@ public static class AndroidCameraStreamer
         await StateGate.WaitAsync(token);
         try
         {
-            var rebuildEffectPipeline = false;
             var cameraRequestChanged = false;
-            var effectModeChanged = false;
             switch (message.Command)
             {
                 case CameraControlCommand.SetExposureCompensation:
@@ -842,130 +952,22 @@ public static class AndroidCameraStreamer
                     _whiteBalanceMode = (CameraWhiteBalanceMode)message.Value;
                     cameraRequestChanged = true;
                     break;
-                case CameraControlCommand.SetEffectMode:
-                    var nextMode = (VideoEffectMode)message.Value;
-                    effectModeChanged = nextMode != _effectMode;
-                    rebuildEffectPipeline =
-                        (_effectMode == VideoEffectMode.Off) !=
-                        (nextMode == VideoEffectMode.Off);
-                    _effectMode = nextMode;
-                    if (effectModeChanged)
-                        Android.Util.Log.Info("BobrCam", $"GPU effect mode: {_effectMode}");
-                    break;
-                case CameraControlCommand.SetBeautySmoothness:
-                    _beautySmoothness = message.Value;
-                    break;
-                case CameraControlCommand.SetBeautyBrightness:
-                    _beautyBrightness = message.Value;
-                    break;
-                case CameraControlCommand.SetBeautyWarmth:
-                    _beautyWarmth = message.Value;
-                    break;
-                case CameraControlCommand.SetBeautyVignette:
-                    _beautyVignette = message.Value;
-                    break;
-                case CameraControlCommand.SetMaskStrength:
-                    _maskStrength = message.Value;
-                    break;
                 default:
                     return;
             }
 
-            UpdateGpuEffectSettings();
-            if (rebuildEffectPipeline && _encoderSurface is not null)
-            {
-                await RebuildEffectCaptureSessionAsync();
+            if (!cameraRequestChanged)
                 return;
-            }
-
-            // Shader-only changes are consumed by the renderer. Repeating the
-            // Camera2 request for every slider event can stall legacy devices.
-            if (!cameraRequestChanged && !effectModeChanged)
-                return;
-
-            // Beauty/Mask changes only need a new Camera2 request when the
-            // device can toggle face detection. Legacy HALs may block while
-            // redundantly replacing an identical repeating request.
-            if (!cameraRequestChanged &&
-                effectModeChanged &&
-                GetBestFaceDetectionMode() == 0)
-            {
-                return;
-            }
 
             if (_captureSession is null || _repeatingRequestBuilder is null)
                 return;
             ApplyCameraSettings(_repeatingRequestBuilder);
-            _captureSession.SetRepeatingRequest(
-                _repeatingRequestBuilder.Build(),
-                FaceCapture,
-                _cameraHandler);
+            SubmitRepeatingRequest();
         }
         finally
         {
             StateGate.Release();
         }
-    }
-
-    private static async Task RebuildEffectCaptureSessionAsync()
-    {
-        await CloseCaptureSessionForProducerSwitchAsync();
-        _repeatingRequestBuilder?.Dispose();
-        _repeatingRequestBuilder = null;
-
-        if (_effectMode == VideoEffectMode.Off)
-        {
-            _gpuRenderer?.Dispose();
-            _gpuRenderer = null;
-        }
-        else
-        {
-            try
-            {
-                EnsureGpuRenderer();
-            }
-            catch (Exception ex)
-            {
-                Android.Util.Log.Error(
-                    "BobrCam",
-                    $"Phone GPU compositor unavailable: {ex}");
-                _effectMode = VideoEffectMode.Off;
-                _gpuRenderer?.Dispose();
-                _gpuRenderer = null;
-                ConnectionStatusChanged?.Invoke(
-                    $"Phone GPU effects unavailable: {ex.GetBaseException().Message}");
-            }
-        }
-
-        await CreateCaptureSessionAsync(streaming: true);
-    }
-
-    private static async Task CloseCaptureSessionForProducerSwitchAsync()
-    {
-        var session = _captureSession;
-        if (session is null)
-            return;
-        var closed = _captureSessionClosed?.Task;
-        try { session.StopRepeating(); } catch { }
-        try { session.AbortCaptures(); } catch { }
-        session.Close();
-        if (closed is not null)
-        {
-            try
-            {
-                await closed.WaitAsync(TimeSpan.FromSeconds(2));
-            }
-            catch (TimeoutException)
-            {
-                Android.Util.Log.Warn(
-                    "BobrCam",
-                    "Camera2 session close timed out before GPU producer switch.");
-            }
-        }
-        session.Dispose();
-        _captureSession = null;
-        _captureSessionCallback = null;
-        _captureSessionClosed = null;
     }
 
     private static async Task ReadControlsAsync(CancellationToken token)
@@ -1016,10 +1018,7 @@ public static class AndroidCameraStreamer
             if (_captureSession is null || _repeatingRequestBuilder is null)
                 return;
             ApplyCameraSettings(_repeatingRequestBuilder);
-            _captureSession.SetRepeatingRequest(
-                _repeatingRequestBuilder.Build(),
-                FaceCapture,
-                _cameraHandler);
+            SubmitRepeatingRequest();
         }
         finally
         {
@@ -1053,10 +1052,6 @@ public static class AndroidCameraStreamer
             flags |= CameraCapabilityFlags.Zoom;
         if (whiteBalanceModes != CameraWhiteBalanceModes.None)
             flags |= CameraCapabilityFlags.WhiteBalance;
-        flags |= CameraCapabilityFlags.PhoneGpuEffects;
-        if (GetBestFaceDetectionMode() > 0)
-            flags |= CameraCapabilityFlags.FaceTracking;
-
         var payload = new byte[VideoProtocol.CameraCapabilitiesSize];
         var capabilities = new CameraCapabilities(
             flags,
@@ -1132,17 +1127,6 @@ public static class AndroidCameraStreamer
                 supported.HasFlag(CameraWhiteBalanceModes.CloudyDaylight),
             _ => false
         };
-
-    private static int GetBestFaceDetectionMode()
-    {
-        var available = (int[]?)_cameraCharacteristics?.Get(
-            CameraCharacteristics.StatisticsInfoAvailableFaceDetectModes);
-        if (available is null || available.Length == 0)
-            return 0;
-        if (available.Contains(2))
-            return 2;
-        return available.Contains(1) ? 1 : 0;
-    }
 
     private static Android.Graphics.Rect? GetCurrentCropRegion()
     {
@@ -1328,19 +1312,36 @@ public static class AndroidCameraStreamer
             token);
     }
 
-    private static MediaCodecProfileLevel GetEncoderLevel()
+    private static MediaCodecProfileLevel GetEncoderLevel() =>
+        GetEncoderLevel(_streamHeight, _streamFps);
+
+    private static MediaCodecProfileLevel GetEncoderLevel(
+        int height,
+        int frameRate)
     {
-        if (_streamHeight >= UltraHdHeight)
-            return _streamFps >= PreferredFps
+        if (frameRate >= 120)
+        {
+            if (height >= UltraHdHeight)
+                return OperatingSystem.IsAndroidVersionAtLeast(29)
+                    ? MediaCodecProfileLevel.Avclevel61
+                    : MediaCodecProfileLevel.Avclevel52;
+            if (height >= QuadHdHeight)
+                return MediaCodecProfileLevel.Avclevel52;
+            return height <= HdHeight
+                ? MediaCodecProfileLevel.Avclevel42
+                : MediaCodecProfileLevel.Avclevel51;
+        }
+        if (height >= UltraHdHeight)
+            return frameRate >= PreferredFps
                 ? MediaCodecProfileLevel.Avclevel52
                 : MediaCodecProfileLevel.Avclevel51;
-        if (_streamHeight >= QuadHdHeight)
-            return _streamFps >= PreferredFps
+        if (height >= QuadHdHeight)
+            return frameRate >= PreferredFps
                 ? MediaCodecProfileLevel.Avclevel51
                 : MediaCodecProfileLevel.Avclevel5;
-        if (_streamHeight <= HdHeight && _streamFps >= PreferredFps)
+        if (height <= HdHeight && frameRate >= PreferredFps)
             return MediaCodecProfileLevel.Avclevel4;
-        if (_streamFps >= PreferredFps)
+        if (frameRate >= PreferredFps)
             return MediaCodecProfileLevel.Avclevel42;
         return OperatingSystem.IsAndroidVersionAtLeast(28)
             ? MediaCodecProfileLevel.Avclevel41
@@ -1349,6 +1350,14 @@ public static class AndroidCameraStreamer
 
     private static byte GetProtocolLevel()
     {
+        if (_streamFps >= 120)
+        {
+            if (_streamHeight >= UltraHdHeight)
+                return 61;
+            if (_streamHeight >= QuadHdHeight)
+                return 52;
+            return _streamHeight <= HdHeight ? (byte)42 : (byte)51;
+        }
         if (_streamHeight >= UltraHdHeight)
             return _streamFps >= PreferredFps ? (byte)52 : (byte)51;
         if (_streamHeight >= QuadHdHeight)
@@ -1423,62 +1432,6 @@ public static class AndroidCameraStreamer
         _captureSession = null;
         LastError = error;
         _streamCancellation?.Cancel();
-    }
-
-    private sealed class FaceCaptureCallback : CameraCaptureSession.CaptureCallback
-    {
-        private int _frameCounter;
-
-        public override void OnCaptureCompleted(
-            CameraCaptureSession session,
-            CaptureRequest request,
-            TotalCaptureResult result)
-        {
-            if (_effectMode != VideoEffectMode.Mask ||
-                _gpuRenderer is null)
-            {
-                return;
-            }
-
-            if (GetBestFaceDetectionMode() == 0)
-                return;
-            if (++_frameCounter % 3 != 0)
-                return;
-            var faceValue = result.Get(CaptureResult.StatisticsFaces);
-            var faces = faceValue is null
-                ? null
-                : Android.Runtime.JNIEnv.GetArray<
-                    Android.Hardware.Camera2.Params.Face>(faceValue.Handle);
-            var crop = GetCurrentCropRegion();
-            if (faces is null || faces.Length == 0 || crop is null)
-            {
-                _gpuRenderer.ClearFace();
-                return;
-            }
-
-            Android.Hardware.Camera2.Params.Face? face = null;
-            long largestArea = 0;
-            foreach (var candidate in faces)
-            {
-                var area = (long)candidate.Bounds.Width() *
-                    candidate.Bounds.Height();
-                if (area <= largestArea)
-                    continue;
-                face = candidate;
-                largestArea = area;
-            }
-            if (face is null)
-            {
-                _gpuRenderer.ClearFace();
-                return;
-            }
-            var bounds = face.Bounds;
-            var left = (bounds.Left - crop.Left) / (float)crop.Width();
-            var top = (bounds.Top - crop.Top) / (float)crop.Height();
-            var right = (bounds.Right - crop.Left) / (float)crop.Width();
-            var bottom = (bounds.Bottom - crop.Top) / (float)crop.Height();
-            _gpuRenderer.SetFaceRect(left, top, right, bottom);
-        }
     }
 
     private sealed class SessionStateCallback(

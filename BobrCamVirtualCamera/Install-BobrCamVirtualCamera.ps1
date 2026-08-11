@@ -26,6 +26,7 @@ $requiredFiles = @(
     (Join-Path $sourceOutput 'libs\avformat-62.dll'),
     (Join-Path $sourceOutput 'libs\avdevice-62.dll'),
     (Join-Path $sourceOutput 'libs\avfilter-11.dll'),
+    (Join-Path $sourceOutput 'libs\FFmpeg-LICENSE.txt'),
     (Join-Path $registrarOutput 'BobrCam.VirtualCamera.exe'),
     (Join-Path $registrarOutput 'BobrCam.VirtualCamera.dll'),
     (Join-Path $registrarOutput 'BobrCam.VirtualCamera.deps.json'),

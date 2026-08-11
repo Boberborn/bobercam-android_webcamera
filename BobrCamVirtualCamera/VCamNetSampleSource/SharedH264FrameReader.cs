@@ -28,32 +28,60 @@ namespace VCamNetSampleSource
         private MemoryMappedFile? _mapping;
         private MemoryMappedViewAccessor? _view;
         private HardwareH264Decoder? _decoder;
+        private IntPtr _d3dDevice;
         private long _generation;
         private long _nextSequence;
         private bool _waitingForKeyFrame = true;
         private string? _lastError;
         public int RotationDegrees { get; private set; }
 
-        public bool TryGetLatestFrame(
-            out byte[] pixels,
+        public void SetD3DDevice(IntPtr device)
+        {
+            if (_d3dDevice == device)
+                return;
+            _d3dDevice = device;
+            _decoder?.Dispose();
+            _decoder = null;
+            _generation = 0;
+        }
+
+        public bool TryGetLatestGpuFrame(
+            out IntPtr texture,
+            out int arraySlice,
             out int width,
             out int height)
         {
-            pixels = Array.Empty<byte>();
+            PumpLatestFrame();
+            var decoder = _decoder;
+            if (decoder != null && decoder.HasGpuFrame)
+            {
+                texture = decoder.TexturePointer;
+                arraySlice = decoder.ArraySlice;
+                width = decoder.FrameWidth;
+                height = decoder.FrameHeight;
+                return true;
+            }
+
+            texture = IntPtr.Zero;
+            arraySlice = 0;
             width = 0;
             height = 0;
+            return false;
+        }
 
+        private void PumpLatestFrame()
+        {
             try
             {
                 EnsureMapping();
                 var view = _view!;
                 if (view.ReadUInt32(0) != Magic ||
                     view.ReadInt32(4) != Version)
-                    return TryGetDecodedFrame(out pixels, out width, out height);
+                    return;
 
                 var generation = view.ReadInt64(8);
                 if (generation <= 0 || (generation & 1) != 0)
-                    return TryGetDecodedFrame(out pixels, out width, out height);
+                    return;
                 var rotationDegrees = view.ReadInt32(44);
                 RotationDegrees = rotationDegrees is 90 or 180 or 270
                     ? rotationDegrees
@@ -63,7 +91,6 @@ namespace VCamNetSampleSource
                     ConfigureDecoder(view, generation);
 
                 PumpAccessUnits(view, generation);
-                return TryGetDecodedFrame(out pixels, out width, out height);
             }
             catch (Exception exception)
             {
@@ -75,7 +102,6 @@ namespace VCamNetSampleSource
                         "Shared H.264 reader: " + exception);
                 }
                 ResetMapping();
-                return TryGetDecodedFrame(out pixels, out width, out height);
             }
         }
 
@@ -117,7 +143,10 @@ namespace VCamNetSampleSource
                 return;
 
             _decoder?.Dispose();
-            _decoder = new HardwareH264Decoder(width, height);
+            _decoder = new HardwareH264Decoder(
+                width,
+                height,
+                _d3dDevice);
             _generation = generation;
             var latestSequence = view.ReadInt64(16);
             _nextSequence = FindNewestKeyFrame(
@@ -227,26 +256,6 @@ namespace VCamNetSampleSource
             return latestSequence + 1;
         }
 
-        private bool TryGetDecodedFrame(
-            out byte[] pixels,
-            out int width,
-            out int height)
-        {
-            var decoder = _decoder;
-            if (decoder != null && decoder.HasFrame)
-            {
-                pixels = decoder.Pixels;
-                width = decoder.FrameWidth;
-                height = decoder.FrameHeight;
-                return true;
-            }
-
-            pixels = Array.Empty<byte>();
-            width = 0;
-            height = 0;
-            return false;
-        }
-
         private void ResetMapping()
         {
             _view?.Dispose();
@@ -270,20 +279,30 @@ namespace VCamNetSampleSource
 
         private AVCodecContext* _codecContext;
         private AVFrame* _decodedFrame;
-        private AVFrame* _softwareFrame;
+        private AVFrame* _outputFrame;
         private AVPacket* _packet;
         private AVBufferRef* _hardwareDevice;
-        private SwsContext* _scaleContext;
         private AVPixelFormat _hardwarePixelFormat = AVPixelFormat.AV_PIX_FMT_NONE;
         private bool _disposed;
+        private readonly IntPtr _externalDevice;
 
-        public byte[] Pixels { get; private set; } = Array.Empty<byte>();
         public int FrameWidth { get; private set; }
         public int FrameHeight { get; private set; }
-        public bool HasFrame => Pixels.Length != 0;
+        public bool HasGpuFrame =>
+            _outputFrame != null && _outputFrame->data[0] != null;
+        public IntPtr TexturePointer => HasGpuFrame
+            ? (IntPtr)_outputFrame->data[0]
+            : IntPtr.Zero;
+        public int ArraySlice => HasGpuFrame
+            ? (int)(IntPtr)_outputFrame->data[1]
+            : 0;
 
-        public HardwareH264Decoder(int width, int height)
+        public HardwareH264Decoder(
+            int width,
+            int height,
+            IntPtr externalDevice)
         {
+            _externalDevice = externalDevice;
             var assemblyDirectory = Path.GetDirectoryName(
                 typeof(HardwareH264Decoder).Assembly.Location)
                 ?? AppContext.BaseDirectory;
@@ -295,10 +314,10 @@ namespace VCamNetSampleSource
 
             _codecContext = ffmpeg.avcodec_alloc_context3(codec);
             _decodedFrame = ffmpeg.av_frame_alloc();
-            _softwareFrame = ffmpeg.av_frame_alloc();
+            _outputFrame = ffmpeg.av_frame_alloc();
             _packet = ffmpeg.av_packet_alloc();
             if (_codecContext == null || _decodedFrame == null ||
-                _softwareFrame == null || _packet == null)
+                _outputFrame == null || _packet == null)
                 throw new OutOfMemoryException("FFmpeg decoder allocation failed.");
 
             _codecContext->width = width;
@@ -385,15 +404,37 @@ namespace VCamNetSampleSource
                         AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA)
                     continue;
 
-                AVBufferRef* hardwareDevice = null;
-                if (ffmpeg.av_hwdevice_ctx_create(
-                        &hardwareDevice,
-                        AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA,
-                        null,
-                        null,
-                        0) < 0)
-                    throw new InvalidOperationException(
-                        "D3D11VA hardware device creation failed.");
+                AVBufferRef* hardwareDevice;
+                if (_externalDevice != IntPtr.Zero)
+                {
+                    hardwareDevice = ffmpeg.av_hwdevice_ctx_alloc(
+                        AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA);
+                    if (hardwareDevice == null)
+                        throw new OutOfMemoryException(
+                            "D3D11VA device context allocation failed.");
+                    var deviceContext =
+                        (AVHWDeviceContext*)hardwareDevice->data;
+                    var d3dContext =
+                        (AVD3D11VADeviceContext*)deviceContext->hwctx;
+                    Marshal.AddRef(_externalDevice);
+                    d3dContext->device =
+                        (FFmpeg.AutoGen.ID3D11Device*)_externalDevice;
+                    ThrowIfError(
+                        ffmpeg.av_hwdevice_ctx_init(hardwareDevice),
+                        "initialize shared D3D11VA device");
+                }
+                else
+                {
+                    hardwareDevice = null;
+                    if (ffmpeg.av_hwdevice_ctx_create(
+                            &hardwareDevice,
+                            AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA,
+                            null,
+                            null,
+                            0) < 0)
+                        throw new InvalidOperationException(
+                            "D3D11VA hardware device creation failed.");
+                }
 
                 _hardwareDevice = hardwareDevice;
                 _hardwarePixelFormat = config->pix_fmt;
@@ -429,58 +470,12 @@ namespace VCamNetSampleSource
                 throw new InvalidOperationException(
                     "FFmpeg returned a non-D3D11 frame.");
 
-            ffmpeg.av_frame_unref(_softwareFrame);
+            ffmpeg.av_frame_unref(_outputFrame);
             ThrowIfError(
-                ffmpeg.av_hwframe_transfer_data(_softwareFrame, decoded, 0),
-                "download D3D11 frame");
-            var source = _softwareFrame;
-            var width = source->width;
-            var height = source->height;
-            var length = checked(width * height * 4);
-            if (Pixels.Length != length)
-                Pixels = GC.AllocateUninitializedArray<byte>(length);
-
-            _scaleContext = ffmpeg.sws_getCachedContext(
-                _scaleContext,
-                width,
-                height,
-                (AVPixelFormat)source->format,
-                width,
-                height,
-                AVPixelFormat.AV_PIX_FMT_BGRA,
-                (int)SwsFlags.SWS_FAST_BILINEAR,
-                null,
-                null,
-                null);
-            if (_scaleContext == null)
-                throw new InvalidOperationException(
-                    "FFmpeg color converter initialization failed.");
-
-            fixed (byte* destination = Pixels)
-            {
-                var destinationData =
-                    new byte_ptrArray4 { [0] = destination };
-                var destinationLines =
-                    new int_array4 { [0] = width * 4 };
-                var sourceData = new byte_ptrArray8();
-                var sourceLines = new int_array8();
-                for (var index = 0; index < 8; index++)
-                {
-                    sourceData[(uint)index] = source->data[(uint)index];
-                    sourceLines[(uint)index] = source->linesize[(uint)index];
-                }
-                ffmpeg.sws_scale(
-                    _scaleContext,
-                    sourceData,
-                    sourceLines,
-                    0,
-                    height,
-                    destinationData,
-                    destinationLines);
-            }
-
-            FrameWidth = width;
-            FrameHeight = height;
+                ffmpeg.av_frame_ref(_outputFrame, decoded),
+                "retain D3D11 frame");
+            FrameWidth = decoded->width;
+            FrameHeight = decoded->height;
         }
 
         private static void ThrowIfError(int error, string operation)
@@ -499,8 +494,6 @@ namespace VCamNetSampleSource
             if (_disposed)
                 return;
             _disposed = true;
-            if (_scaleContext != null)
-                ffmpeg.sws_freeContext(_scaleContext);
             if (_packet != null)
             {
                 var packet = _packet;
@@ -513,11 +506,11 @@ namespace VCamNetSampleSource
                 ffmpeg.av_frame_free(&frame);
                 _decodedFrame = null;
             }
-            if (_softwareFrame != null)
+            if (_outputFrame != null)
             {
-                var frame = _softwareFrame;
+                var frame = _outputFrame;
                 ffmpeg.av_frame_free(&frame);
-                _softwareFrame = null;
+                _outputFrame = null;
             }
             if (_codecContext != null)
             {

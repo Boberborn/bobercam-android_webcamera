@@ -37,12 +37,12 @@ public sealed class VideoReceiver
     public ushort RequestedHeight { get; set; } = 1080;
     public bool PrioritizeResolution { get; set; }
     public bool UseFrontCamera { get; private set; }
-    public Task StartAsync(
+    public async Task StartAsync(
         string bindAddress,
         int port,
         int usbHostPort = VideoProtocol.UsbHostPort)
     {
-        if (_cancellation is not null) return Task.CompletedTask;
+        if (_cancellation is not null) return;
         var wifiAddress = string.IsNullOrWhiteSpace(bindAddress)
             ? IPAddress.Any
             : IPAddress.Parse(bindAddress);
@@ -68,7 +68,9 @@ public sealed class VideoReceiver
 
         _wifiListener = new TcpListener(wifiAddress, port);
         _usbListener = new TcpListener(IPAddress.Loopback, usbHostPort);
-        _identity = SecureIdentity.GetOrCreate("bobrcam-receiver.pfx", "BobrCam Windows");
+        _identity = await SecureIdentity.GetOrCreateAsync(
+            "bobrcam-receiver.pfx",
+            "BobrCam Windows");
         _cancellation = new CancellationTokenSource();
         _wifiListener.Start(8);
         try
@@ -89,7 +91,18 @@ public sealed class VideoReceiver
         _ = AcceptLoopAsync(_wifiListener, isUsb: false, _cancellation.Token);
         _ = AcceptLoopAsync(_usbListener, isUsb: true, _cancellation.Token);
         StatusChanged?.Invoke("Waiting for a phone — automatic connection enabled.");
-        return Task.CompletedTask;
+    }
+
+    public void ForgetTrustedPhone()
+    {
+        lock (_activeConnectionGate)
+        {
+            _activeConnectionCancellation?.Cancel();
+            _activeClient?.Dispose();
+        }
+        SecureIdentity.ForgetTrustedPhone();
+        StatusChanged?.Invoke(
+            "Trusted phone forgotten — the next phone will be trusted automatically.");
     }
 
     public async Task StopAsync()
@@ -235,6 +248,9 @@ public sealed class VideoReceiver
                     await ValidatePhoneHandshakeAsync(
                         transport,
                         handshakeTimeout.Token);
+                if (!await SecureIdentity.TrustPhoneAsync(sessionToken))
+                    throw new AuthenticationException(
+                        "This receiver trusts a different phone. Forget it before pairing another phone.");
                 await SendStreamRequestAsync(
                     transport,
                     RequestedFrameRate,

@@ -19,20 +19,7 @@ public enum CameraControlCommand : byte
     ToggleFlash = 2,
     SetExposureCompensation = 3,
     SetZoom = 4,
-    SetWhiteBalance = 5,
-    SetEffectMode = 10,
-    SetBeautySmoothness = 11,
-    SetBeautyBrightness = 12,
-    SetBeautyWarmth = 13,
-    SetBeautyVignette = 14,
-    SetMaskStrength = 15
-}
-
-public enum VideoEffectMode : byte
-{
-    Off = 0,
-    Beauty = 1,
-    Mask = 2
+    SetWhiteBalance = 5
 }
 
 public enum CameraWhiteBalanceMode : byte
@@ -51,9 +38,7 @@ public enum CameraCapabilityFlags : byte
     Flash = 1 << 0,
     ExposureCompensation = 1 << 1,
     Zoom = 1 << 2,
-    WhiteBalance = 1 << 3,
-    PhoneGpuEffects = 1 << 4,
-    FaceTracking = 1 << 5
+    WhiteBalance = 1 << 3
 }
 
 [Flags]
@@ -229,7 +214,7 @@ public static class VideoProtocol
         bool useFrontCamera)
     {
         if (destination.Length < StreamRequestSize ||
-            frameRate is not (30 or 60) ||
+            frameRate is not (30 or 60 or 120) ||
             !IsValidStreamResolution(width, height))
             return false;
 
@@ -257,7 +242,7 @@ public static class VideoProtocol
         useFrontCamera = false;
         if (source.Length < StreamRequestSize ||
             BinaryPrimitives.ReadUInt32BigEndian(source) != StreamRequestMagic ||
-            source[4] is not (30 or 60) ||
+            source[4] is not (30 or 60 or 120) ||
             source[9] > 1 ||
             source[10] > 1)
         {
@@ -525,15 +510,6 @@ public static class VideoProtocol
                 message.Value is >= 100 and <= ushort.MaxValue,
             CameraControlCommand.SetWhiteBalance =>
                 Enum.IsDefined((CameraWhiteBalanceMode)message.Value),
-            CameraControlCommand.SetEffectMode =>
-                Enum.IsDefined((VideoEffectMode)message.Value),
-            CameraControlCommand.SetBeautySmoothness or
-                CameraControlCommand.SetBeautyVignette or
-                CameraControlCommand.SetMaskStrength =>
-                    message.Value is >= 0 and <= 100,
-            CameraControlCommand.SetBeautyBrightness or
-                CameraControlCommand.SetBeautyWarmth =>
-                    message.Value is >= -50 and <= 50,
             _ => false
         };
 
@@ -543,7 +519,7 @@ public static class VideoProtocol
         configuration.FrameRateNumerator > 0 &&
         configuration.FrameRateDenominator > 0 &&
         (double)configuration.FrameRateNumerator /
-            configuration.FrameRateDenominator <= 60 &&
+            configuration.FrameRateDenominator <= 120 &&
         configuration.Bitrate is > 0 and <= 50_000_000 &&
         configuration.Profile is H264Profile.Baseline or H264Profile.Main or H264Profile.High &&
         configuration.Level > 0 &&

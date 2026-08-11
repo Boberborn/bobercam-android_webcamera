@@ -26,100 +26,11 @@ namespace VCamNetSampleSource
         private ComObject<IMFTransform>? _converter;
         private IComObject<IWICBitmap>? _bitmap;
         private ComObject<IMFDXGIDeviceManager>? _dxgiManager;
+        private GpuNv12FrameRenderer? _gpuPhoneRenderer;
 
         public bool HasD3DManager => _texture != null;
         public ulong FrameCount => _frameCount;
         private readonly SharedH264FrameReader _sharedH264Frames = new();
-        private IComObject<ID2D1Bitmap>? _lastPhoneFrame;
-        private int _lastPhoneFrameWidth;
-        private int _lastPhoneFrameHeight;
-
-        private unsafe bool TryDrawPhoneFrame()
-        {
-            if (_renderTarget == null)
-                return false;
-
-            try
-            {
-                if (!_sharedH264Frames.TryGetLatestFrame(
-                        out var pixels,
-                        out var sourceWidth,
-                        out var sourceHeight))
-                    return DrawLastPhoneFrame();
-
-                ID2D1Bitmap bitmap;
-                var properties = new D2D1_BITMAP_PROPERTIES
-                {
-                    dpiX = 96,
-                    dpiY = 96,
-                    pixelFormat = new D2D1_PIXEL_FORMAT
-                    {
-                        format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode = D2D1_ALPHA_MODE.D2D1_ALPHA_MODE_IGNORE
-                    }
-                };
-                fixed (byte* pointer = pixels)
-                {
-                    _renderTarget.Object.CreateBitmap(
-                        new D2D_SIZE_U((uint)sourceWidth, (uint)sourceHeight),
-                        (IntPtr)pointer,
-                        (uint)(sourceWidth * 4),
-                        ref properties,
-                        out bitmap).ThrowOnError();
-                }
-                var previousFrame = _lastPhoneFrame;
-                _lastPhoneFrame = new ComObject<ID2D1Bitmap>(bitmap);
-                _lastPhoneFrameWidth = sourceWidth;
-                _lastPhoneFrameHeight = sourceHeight;
-                previousFrame?.Dispose();
-                return DrawLastPhoneFrame();
-            }
-            catch
-            {
-                return DrawLastPhoneFrame();
-            }
-        }
-
-        private bool DrawLastPhoneFrame()
-        {
-            var frame = _lastPhoneFrame;
-            if (_renderTarget == null || frame == null ||
-                _lastPhoneFrameWidth <= 0 || _lastPhoneFrameHeight <= 0)
-                return false;
-
-            var rotationDegrees = _sharedH264Frames.RotationDegrees;
-            var quarterTurn = rotationDegrees is 90 or 270;
-            var outputSourceWidth = quarterTurn
-                ? _lastPhoneFrameHeight
-                : _lastPhoneFrameWidth;
-            var outputSourceHeight = quarterTurn
-                ? _lastPhoneFrameWidth
-                : _lastPhoneFrameHeight;
-            var scale = Math.Min(
-                _width / (float)outputSourceWidth,
-                _height / (float)outputSourceHeight);
-            var width = _lastPhoneFrameWidth * scale;
-            var height = _lastPhoneFrameHeight * scale;
-            var left = (_width - width) / 2f;
-            var top = (_height - height) / 2f;
-            var transform = D2D_MATRIX_3X2_F.Rotation(
-                rotationDegrees,
-                _width / 2f,
-                _height / 2f);
-            _renderTarget.Object.SetTransform(ref transform);
-            try
-            {
-                _renderTarget.DrawBitmap(frame, 1f,
-                    D2D1_BITMAP_INTERPOLATION_MODE.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    new D2D_RECT_F(left, top, left + width, top + height), null);
-            }
-            finally
-            {
-                var identity = D2D_MATRIX_3X2_F.Identity();
-                _renderTarget.Object.SetTransform(ref identity);
-            }
-            return true;
-        }
 
         // common to CPU & GPU
         private HRESULT CreateRenderTargetResources(uint width, uint height)
@@ -182,6 +93,11 @@ namespace VCamNetSampleSource
 
             // create a texture/surface to write
             using var device = new ComObject<ID3D11Device>((ID3D11Device)obj);
+            _gpuPhoneRenderer?.Dispose();
+            _gpuPhoneRenderer = new GpuNv12FrameRenderer(device.Object);
+            ComObject.WithComPointer(
+                device.Object,
+                pointer => _sharedH264Frames.SetD3DDevice(pointer));
             _texture = device.CreateTexture2D(new D3D11_TEXTURE2D_DESC
             {
                 Format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -253,15 +169,35 @@ namespace VCamNetSampleSource
                 ArgumentNullException.ThrowIfNull(sample);
                 IComObject<IMFSample>? outSample;
 
+                if (HasD3DManager &&
+                    format == MFConstants.MFVideoFormat_NV12 &&
+                    _gpuPhoneRenderer != null &&
+                    _sharedH264Frames.TryGetLatestGpuFrame(
+                        out var phoneTexture,
+                        out var phoneSlice,
+                        out var phoneWidth,
+                        out var phoneHeight) &&
+                    _gpuPhoneRenderer.TryRender(
+                        phoneTexture,
+                        phoneSlice,
+                        phoneWidth,
+                        phoneHeight,
+                        _sharedH264Frames.RotationDegrees,
+                        sample,
+                        _width,
+                        _height))
+                {
+                    _frameCount++;
+                    return sample;
+                }
+
                 // render something on image common to CPU & GPU
                 if (_renderTarget != null && _textFormat != null && _dwrite != null && _whiteBrush != null && _blockBrushes != null)
                 {
                     _renderTarget.BeginDraw();
                     _renderTarget.Clear(new _D3DCOLORVALUE(0, 0, 0, 1));
 
-                    if (!TryDrawPhoneFrame())
-                    {
-                        // Show the diagnostic pattern until the first phone frame arrives.
+                    // Show the diagnostic pattern until the first phone frame arrives.
                         var k = 0;
                         for (uint i = 0; i < _width / DIVISOR; i++)
                         {
@@ -319,9 +255,8 @@ namespace VCamNetSampleSource
 
                     var text = $"Format: {fmt}\n.NET Frame#: {_frameCount}\nFps: {_fps}\nResolution: {_width} x {_height}";
 
-                        using var layout = _dwrite.CreateTextLayout(_textFormat, text, text.Length, _width, _height);
-                        _renderTarget.DrawTextLayout(new D2D_POINT_2F(0, 0), layout, _whiteBrush);
-                    }
+                    using var layout = _dwrite.CreateTextLayout(_textFormat, text, text.Length, _width, _height);
+                    _renderTarget.DrawTextLayout(new D2D_POINT_2F(0, 0), layout, _whiteBrush);
                     _renderTarget.EndDraw();
                 }
 
@@ -422,10 +357,11 @@ namespace VCamNetSampleSource
                         _texture.SafeDispose();
                         _textFormat.SafeDispose();
                         _dwrite.SafeDispose();
-                        _lastPhoneFrame.SafeDispose();
                         _renderTarget.SafeDispose();
                         _converter.SafeDispose();
                         _sharedH264Frames.Dispose();
+                        _gpuPhoneRenderer?.Dispose();
+                        _gpuPhoneRenderer = null;
                     }
 
                     // free unmanaged resources (unmanaged objects) and override finalizer

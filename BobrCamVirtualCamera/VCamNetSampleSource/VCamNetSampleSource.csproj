@@ -23,6 +23,9 @@
 	  <None Include="..\..\BobrCam\libs\*.dll"
 	        Link="libs\%(Filename)%(Extension)"
 	        CopyToOutputDirectory="PreserveNewest" />
+	  <None Include="..\..\BobrCam\libs\FFmpeg-LICENSE.txt"
+	        Link="libs\FFmpeg-LICENSE.txt"
+	        CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 </Project>
