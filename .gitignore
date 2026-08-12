@@ -32,3 +32,4 @@ CLAUDE.md
 .env.*
 appsettings.*.local.json
 .release-temp/
+artifacts/
