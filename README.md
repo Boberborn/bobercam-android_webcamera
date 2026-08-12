@@ -4,6 +4,14 @@
 
 Use your phone's camera as a high-quality video source for OBS, Zoom, Teams, browsers, or the Windows Camera app. BobrCam streams authenticated H.264 over Wi-Fi or USB with low latency.
 
+[Download the latest release](https://github.com/Boberborn/bobercam-android_webcamera/releases/latest)
+
+## Preview
+
+| Live receiver | Compact layout |
+| --- | --- |
+| ![BobrCam Windows receiver showing a live phone-camera stream](docs/screenshots/windows-app.png) | ![BobrCam compact Windows receiver](docs/screenshots/windows-compact.png) |
+
 ## Features
 
 - **Full HD 60fps** camera streaming (resolves to best available resolution on your device)
@@ -11,8 +19,10 @@ Use your phone's camera as a high-quality video source for OBS, Zoom, Teams, bro
 - **Wi-Fi** — auto-discovery via UDP broadcast or manual IP/port entry
 - **USB (ADB)** — local-only wired transport; enable USB debugging and authorize the PC
 - **Virtual camera** — appears as `BobrCam (Windows Virtual Camera)` in any app
-- **Live phone preview** — hardware-accelerated camera preview on the phone using `TextureView`
-- **Auto-fit window** — PC preview window resizes to match the exact camera resolution
+- **Hardware H.264** — hardware encoding on Android and D3D11VA decoding on Windows
+- **Flexible modes** — select resolution and frame rate based on phone capabilities
+- **Camera controls** — switch cameras, rotate, mirror, flash, exposure, zoom, and white balance
+- **Auto reconnect** — resumes streaming after temporary connection loss
 
 ## Requirements
 
@@ -22,6 +32,9 @@ Use your phone's camera as a high-quality video source for OBS, Zoom, Teams, bro
 - **ADB** (optional) — for USB connection
 
 ## Quick Start
+
+Download the signed Android APK and Windows installer from
+[GitHub Releases](https://github.com/Boberborn/bobercam-android_webcamera/releases).
 
 ### Build
 
@@ -79,9 +92,8 @@ Once connected, `BobrCam (Windows Virtual Camera)` appears in the camera list of
 - Plain USB traffic terminates only on the Windows loopback listener at `127.0.0.1:28446`
 - Strict packet sizes, stream limits, timeouts, concurrent-handshake limits, and failed-authentication rate limits
 
-Initial Wi-Fi certificate pairing is currently trust-on-first-use. Before a
-public release, add an on-screen short-code or QR confirmation so an active
-attacker on the same LAN cannot race the first discovery response.
+Initial Wi-Fi certificate pairing uses trust on first use. Only connect on a
+network you trust.
 
 ## Future charge-only USB support
 
