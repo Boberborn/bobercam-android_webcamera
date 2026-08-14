@@ -621,15 +621,15 @@ internal sealed unsafe class FfmpegH264Decoder : IDisposable
 
         if (codecData is { Length: > 0 })
         {
-            var copy = new byte[codecData.Length + 1];
-            Buffer.BlockCopy(codecData, 0, copy, 0, codecData.Length);
-            fixed (byte* source = copy)
-            {
-                _codecContext->extradata = (byte*)ffmpeg.av_malloc((nuint)copy.Length);
-                _codecContext->extradata_size = copy.Length;
-                Buffer.MemoryCopy(source, _codecContext->extradata, codecData.Length, codecData.Length);
-                _codecContext->extradata[codecData.Length] = 0;
-            }
+            const int extradataPadding = 64;
+            _codecContext->extradata = (byte*)ffmpeg.av_mallocz((nuint)(codecData.Length + extradataPadding));
+            _codecContext->extradata_size = codecData.Length;
+            fixed (byte* source = codecData)
+                Buffer.MemoryCopy(
+                    source,
+                    _codecContext->extradata,
+                    codecData.Length,
+                    codecData.Length);
         }
         EnableD3D11va(codec);
         ThrowIfError(ffmpeg.avcodec_open2(_codecContext, codec, null), "open H.264 decoder");
