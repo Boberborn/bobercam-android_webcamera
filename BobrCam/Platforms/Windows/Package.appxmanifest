@@ -6,13 +6,13 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap rescap">
 
-  <Identity Name="maui-package-name-placeholder" Publisher="CN=User Name" Version="0.0.0.0" />
+  <Identity Name="Boberborn.BobrCam" Publisher="CN=B8512DDE-4961-4550-986D-F5A2595ABA35" Version="0.0.0.0" />
 
   <mp:PhoneIdentity PhoneProductId="284F9D86-4A7D-4CF6-8D4E-621C21FFB8FB" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
   <Properties>
     <DisplayName>$placeholder$</DisplayName>
-    <PublisherDisplayName>User Name</PublisherDisplayName>
+    <PublisherDisplayName>Boberborn</PublisherDisplayName>
     <Logo>$placeholder$.png</Logo>
   </Properties>
 

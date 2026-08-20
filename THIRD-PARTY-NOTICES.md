@@ -17,3 +17,19 @@ Bundled build:
 BobrCam does not modify the bundled FFmpeg libraries. Users may replace these
 dynamically linked libraries with a compatible build as permitted by the
 license.
+
+## FFmpeg.AutoGen (8.1.0)
+
+Licensed under LGPL-3.0. .NET bindings for FFmpeg.
+Source: https://github.com/Ruslan-B/FFmpeg.AutoGen
+
+## DirectNCore (1.16.1.2)
+
+Licensed under MIT. DirectShow .NET wrapper.
+Source: https://github.com/jevgenijraskatov/DirectNCore
+
+## Microsoft.Maui / Microsoft.Extensions
+
+Licensed under MIT. .NET MAUI framework and logging abstractions.
+Source: https://github.com/dotnet/maui
+Source: https://github.com/dotnet/runtime

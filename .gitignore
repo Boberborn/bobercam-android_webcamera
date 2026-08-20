@@ -3,6 +3,10 @@
 **/obj/
 publish_win/
 
+# Release binaries and build logs
+releases/
+*.log
+
 # Local tools and reference material
 .agents/
 .codex/
